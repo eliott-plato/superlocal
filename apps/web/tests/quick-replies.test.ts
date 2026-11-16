@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   canUseQuickReplies,
+  emptyDraftBody,
   getQuickReplies,
   quickReplyBody,
 } from "../src/quick-replies.ts";
@@ -25,6 +26,16 @@ test("quick responses fill only empty replies, never existing writing or forward
   }
   assert.equal(canUseQuickReplies({ mode: "forward", body: "" }), false);
   assert.equal(canUseQuickReplies({ mode: "new", body: "" }), false);
+});
+
+test("a freshly normalized draft is empty, so the composer can add the signature", () => {
+  // Drafts normalize an empty body to formatting-only markup, never to "".
+  for (const body of ["", "<div></div>", "<div><br></div><div><br></div>", "<p>&nbsp;</p>"]) {
+    assert.equal(emptyDraftBody(body), true);
+  }
+  for (const body of ["<div>Hi</div>", "<div>Jane Doe<br>Example Co</div>", '<img src="logo.png">']) {
+    assert.equal(emptyDraftBody(body), false);
+  }
 });
 
 test("inserting a canned response escapes markup and preserves line breaks", () => {
