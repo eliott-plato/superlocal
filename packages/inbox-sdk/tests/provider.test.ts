@@ -4028,6 +4028,19 @@ describe('Gmail read-only body and pagination regressions', () => {
       const before = calls.length
       await failure(() => provider.sync(null, options), 'VALIDATION', false)
       expect(calls).toHaveLength(before + 2)
+      // A bounded history walk keeps its first bound across pages; the incremental cursor drops it.
+      rejectFirstPage = false
+      rejection = undefined
+      const since = '2026-01-01T00:00:00.000Z', later = '2026-06-01T00:00:00.000Z'
+      const listed = () => calls.filter(url => url.pathname === `${base}/messages`).at(-1)!
+      const bounded = await provider.sync(null, { ...options, after: since }, { lane: 'backfill' })
+      expect(listed().searchParams.get('q')).toBe(`after:${Date.parse(since) / 1000}`)
+      expect(bounded.cursor!.metadata!.after).toBe(since)
+      expect(bounded.recentCursor!.metadata!.after).toBeUndefined()
+      await provider.sync(bounded.cursor, { ...options, after: later }, { lane: 'backfill' })
+      expect(listed().searchParams.get('q')).toBe(`after:${Date.parse(since) / 1000}`)
+      await provider.sync(null, options)
+      expect(listed().searchParams.has('q')).toBe(false)
     } finally { await Promise.all([provider.disconnect(), other.disconnect()]) }
   })
 })

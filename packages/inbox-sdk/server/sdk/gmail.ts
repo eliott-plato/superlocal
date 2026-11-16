@@ -813,12 +813,16 @@ export class GmailProvider implements InboxProvider {
     }
 
     // Qualified sync cursors keep native page tokens separate from public list continuations.
+    // A page token belongs to its query, so one walk keeps the bound it started with.
+    const after = cursor?.metadata?.pageToken ? cursor.metadata.after : options.after
+    const since = after ? Math.floor(Date.parse(after) / 1000) : NaN
     let listing: GmailListResponse
     try {
       listing = await this.request<GmailListResponse>(`/users/me/messages?${this.query({
         folder: options.folder,
         limit: options.limit,
         cursor: cursor?.metadata?.pageToken,
+        ...(Number.isFinite(since) ? { search: `after:${since}` } : {}),
       })}`)
     } catch (error) {
       if (cursor?.metadata?.pageToken && isRejectedPageToken(error)) return this.fullSync(null, options)
@@ -833,7 +837,7 @@ export class GmailProvider implements InboxProvider {
       ...(options.folder ? { folder: options.folder } : {}),
       metadata: {
         accountId: this.accountId,
-        ...(listing.nextPageToken ? { pageToken: listing.nextPageToken, incrementalCursorKind: 'history' } : {}),
+        ...(listing.nextPageToken ? { pageToken: listing.nextPageToken, incrementalCursorKind: 'history', ...(Number.isFinite(since) ? { after: after! } : {}) } : {}),
       },
     }
     return {

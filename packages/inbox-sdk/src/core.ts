@@ -2198,7 +2198,9 @@ export function createInbox(options: InboxOptions): Inbox {
         const definition = definitions.get((JSON.parse(row.data) as Account).providerId)
         const known = definition?.syncHints === false ? undefined : db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
           "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred,json_extract(confirmed,'$.folder') folder FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
-        const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
+        const historyDays = lane === 'backfill' ? definition?.syncFolders?.[scope]?.historyDays : undefined
+        const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}),
+          ...(historyDays ? { after: new Date(now() - historyDays * 86_400_000).toISOString() } : {}) }
         // Runtime hints are separate from providers' validated operation input.
         const syncContext = {
           lane,
@@ -2256,6 +2258,9 @@ export function createInbox(options: InboxOptions): Inbox {
               if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
               const value: MessageSummary = JSON.parse(removed.confirmed)
               const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR (json_type(data,\'$.custom\') IS NOT \'true\' AND json_extract(data,\'$.role\')=?))').all(id, scope, scope)
+              // Shared native history reports every change to each folder scope; leaving a folder
+              // the message never had is not a change.
+              if (value.folder !== scope && !value.folderIds.some(fid => folderIds.some(folder => folder.id === fid))) continue
               value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
               if (value.folder === scope) value.folder = 'archive'
               db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
@@ -3308,14 +3313,18 @@ export function createInbox(options: InboxOptions): Inbox {
         })
         await runtime.runPromise(Effect.forEach(rows, row => Effect.tryPromise({
           try: async () => {
-            await synchronizeSource(row.owner, row.id, {}, true)
-            const checkpointScope = `mailboxes:${sourceSelection(row.owner, row.id).key}:inbox`
-            const backfill = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND lane=\'backfill\' AND scope=?').get(row.id, row.generation, checkpointScope)
-            // Only resume explicitly started history. Partial coverage (including a rejected
-            // latest cursor) is not permission to begin another whole-mailbox import.
-            if (backfill && (JSON.parse(backfill.data) as SyncCheckpoint).cursor) {
-              await synchronizeSource(row.owner, row.id, { lane: 'backfill' }, true)
+            const folders = ['inbox', ...Object.keys(definitions.get((JSON.parse(row.data) as Account).providerId)?.syncFolders ?? {})]
+            for (const folder of folders) await synchronizeSource(row.owner, row.id, { folder }, true)
+            const key = sourceSelection(row.owner, row.id).key
+            const backfill = (folder: string) => {
+              const saved = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND lane=\'backfill\' AND scope=?').get(row.id, row.generation, `mailboxes:${key}:${folder}`)
+              return saved ? JSON.parse(saved.data) as SyncCheckpoint : undefined
             }
+            // Only resume explicitly started history. Partial coverage (including a rejected
+            // latest cursor) is not permission to begin another whole-mailbox import. Declared
+            // folders follow a started inbox import in order; one backfill page per poll.
+            const next = backfill('inbox') && folders.find(folder => { const checkpoint = backfill(folder); return checkpoint ? !!checkpoint.cursor : folder !== 'inbox' })
+            if (next) await synchronizeSource(row.owner, row.id, { folder: next, lane: 'backfill' }, true)
           }, catch: failure,
         }).pipe(Effect.catchAll(error => Effect.sync(() => options.log?.({ code: error.code, operation: 'sync' })))), { concurrency, discard: true }))
       }).finally(() => { polling = undefined })

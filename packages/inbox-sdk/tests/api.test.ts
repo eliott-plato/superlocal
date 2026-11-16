@@ -2082,8 +2082,8 @@ function cursorValue(cursor: SyncCursor | string | null | undefined) {
   return typeof cursor === 'string' ? cursor : cursor?.value ?? null
 }
 
-async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOAuthConfig } = {}) {
-  const { googleOAuth: _hostGoogle, ...inboxOptions } = options
+async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOAuthConfig; syncFolders?: ProviderDefinition['syncFolders'] } = {}) {
+  const { googleOAuth: _hostGoogle, syncFolders, ...inboxOptions } = options
   const directory = await mkdtemp(join(TEMP_ROOT, 'inbox-api-'))
   const database = join(directory, 'mail.sqlite')
   const clock = { value: EPOCH }
@@ -2111,6 +2111,7 @@ async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOA
     id, name: id, connection: id === 'gmail' ? 'oauth' : 'credentials', scopes: ['mail'],
     nativeCategoryRoles: { 'native-promotions': 'promotions' },
     ...(id === SCOPED ? { mailboxSelection: 'manual' as const } : {}),
+    ...(id === FULL && syncFolders ? { syncFolders } : {}),
     create(credentials) {
       if (id === SCOPED && credentials.apiKey !== SECRET) throw new ProviderAuthenticationError(id, 'Invalid reference API key')
       const box = boxes.get(id === 'gmail' ? google.access.get(String(credentials.accessToken)) ?? '' : String(credentials.mailbox))
@@ -8532,6 +8533,40 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     expect(box.calls.sync.at(-1)!.context?.knownMessageStates).toHaveLength(600)
     expect((await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [mailbox.id] }))[0]).toMatchObject({ state: 'idle', coverage: 'partial' })
     expect((await h.page()).total).toBe(600)
+  })
+
+  test('declared folders poll beside the inbox and import bounded history only after a started inbox import, one page per poll', async () => {
+    const h = await fixture({ syncIntervalMs: 1000, syncFolders: { sent: { historyDays: 365 } } })
+    const { box } = await h.connect('alice', 'declared-folders')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const poll = async (...receipts: SyncResult[]) => {
+      const before = box.calls.sync.length
+      for (const result of receipts) box.nextSync(result)
+      h.clock.value += 1001
+      await h.inbox.poll()
+      return box.calls.sync.slice(before).map(call => [call.options.folder, call.context?.lane, cursorValue(call.cursor), call.options.after ?? null])
+    }
+    const head = native('head'), mine = native('mine', { folder: 'sent', from: participant('declared-folders@example.test') })
+    expect(await poll(receipt([head], 'inbox-1'), receipt([mine], 'sent-1'))).toEqual([['inbox', 'latest', null, null], ['sent', 'latest', null, null]])
+    // Without a started inbox import, neither folder begins whole-mailbox history.
+    expect(await poll(receipt([], 'inbox-2'), receipt([], 'sent-2'))).toEqual([['inbox', 'latest', 'inbox-1', null], ['sent', 'latest', 'sent-1', null]])
+    box.nextSync(receipt([native('old-inbox')], 'inbox-older', { fullSync: true, hasMore: true, cursor: { provider: FULL, kind: 'page', value: 'inbox-older' } }))
+    await h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill' })
+    expect(box.calls.sync.at(-1)!.options.after).toBeUndefined()
+    expect(await poll(receipt([], 'inbox-3'), receipt([], 'sent-3'), receipt([native('oldest-inbox')], 'inbox-done', { fullSync: true, cursor: null })))
+      .toEqual([['inbox', 'latest', 'inbox-2', null], ['sent', 'latest', 'sent-2', null], ['inbox', 'backfill', 'inbox-older', null]])
+    const after = new Date(h.clock.value + 1001 - 365 * 86_400_000).toISOString()
+    expect(await poll(receipt([], 'inbox-4'), receipt([], 'sent-4'), receipt([native('old-sent', { folder: 'sent' })], 'sent-older', {
+      fullSync: true, hasMore: true, cursor: { provider: FULL, kind: 'page', value: 'sent-older' } })))
+      .toEqual([['inbox', 'latest', 'inbox-3', null], ['sent', 'latest', 'sent-3', null], ['sent', 'backfill', null, after]])
+    expect((await poll(receipt([], 'inbox-5'), receipt([], 'sent-5'), receipt([native('oldest-sent', { folder: 'sent' })], 'sent-done', { fullSync: true, cursor: null }))).at(-1)!.slice(0, 3))
+      .toEqual(['sent', 'backfill', 'sent-older'])
+    // Shared native history reports inbox changes to the Sent scope; that is not a removal.
+    const baseline = await h.inbox.changes('alice')
+    expect(await poll(receipt([], 'inbox-6'), receipt([], 'sent-6', { removedMessageIds: ['head'] }))).toEqual([['inbox', 'latest', 'inbox-5', null], ['sent', 'latest', 'sent-5', null]])
+    expect((await h.inbox.changes('alice', { since: baseline.state })).events).toEqual([])
+    const stored = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], folder: 'sent', limit: 10 })).items.map(message => message.subject).sort()
+    expect(stored).toEqual(['Subject mine', 'Subject old-sent', 'Subject oldest-sent'])
   })
 
   test('built-in Gmail and mock skip sync hints while other definitions retain the default', () => {

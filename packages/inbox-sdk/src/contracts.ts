@@ -129,6 +129,9 @@ export interface ProviderDefinition {
   nativeCategoryRoles?: Readonly<Record<string, string>>
   /** Defaults to true. False omits knownMessageIds/knownMessageStates only; use it only if sync never consumes them. */
   syncHints?: boolean
+  /** Native folders polled alongside the inbox. Their backfill follows an explicitly started inbox
+   * history import, after it completes; historyDays bounds how far back that import lists. */
+  syncFolders?: Readonly<Record<string, { historyDays?: number }>>
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
   /** Runtime cancellation is separate from provider-validated credential fields. */

@@ -61,6 +61,8 @@ export interface SyncOptions extends SyncContext {
   folder?: MailFolder
   limit?: number
   mailboxScopes?: MailScope[]
+  /** Lists only mail received at or after this ISO instant. Providers keep one walk's bound in its cursor. */
+  after?: string
 }
 
 export interface SyncResult {
