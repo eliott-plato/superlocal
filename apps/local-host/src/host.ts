@@ -106,7 +106,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const real = createRealRegistrations(config, runtime, environment)
       registrations = real.registrations
       inbox = createInbox({ database: join(runtime.dataDir, 'inbox.sqlite'), encryptionKey: runtime.encryptionKey,
-        providers: registrations.map(registration => registration.definition), allowProviderWrites: config.allowProviderWrites,
+        providers: registrations.map(registration => registration.definition), allowProviderWrites: config.allowProviderWrites, draftSync: config.draftSync,
         defaultPolicy: { remoteImages: true },
         verifyCredentials: real.verifyCredentials, log: event => console.info(JSON.stringify({ event: 'local.sdk', code: /^[A-Z][A-Z0-9_]{0,79}$/.test(event.code) ? event.code : 'SDK_ERROR' })) })
     }

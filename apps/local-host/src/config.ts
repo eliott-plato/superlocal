@@ -31,6 +31,8 @@ export interface LocalConfig {
   backend: { port: number }
   auth: { method: 'loopback' | 'google'; sessionHours: number; allowedEmails?: string[] }
   allowProviderWrites: boolean
+  /** Native provider drafts: import mirrors them read-only; two-way also writes local edits back. */
+  draftSync: 'off' | 'import' | 'two-way'
   providers: {
     mock: ProviderConfig
     gmail: ProviderConfig & { oauth: { clientId: SecretSource; clientSecret: SecretSource; scopes: string[] } }
@@ -162,7 +164,7 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   const environment = options.environment ?? process.env
   const configPath = resolve(options.configPath ?? environment.SUPERLOCAL_CONFIG ?? join(ROOT_DIR, 'superlocal.local.json'))
   writePrivateJson(configPath, defaults())
-  const input = record(readPrivateJson(configPath, 'superlocal.local.json'), 'root', ['version', 'instanceId', 'mode', 'dataDir', 'web', 'backend', 'auth', 'allowProviderWrites', 'providers'])
+  const input = record(readPrivateJson(configPath, 'superlocal.local.json'), 'root', ['version', 'instanceId', 'mode', 'dataDir', 'web', 'backend', 'auth', 'allowProviderWrites', 'draftSync', 'providers'])
   if (input.version !== 1) invalid('version')
   if (typeof input.instanceId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.instanceId)) invalid('instanceId')
   if (input.mode !== 'mock' && input.mode !== 'real') invalid('mode')
@@ -177,6 +179,8 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   const allowedEmails = normalizeAllowedEmails(environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS === undefined ? auth.allowedEmails ?? [] :
     environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.trim() === '' ? [] : environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.split(','))
   const writes = record(input.allowProviderWrites, 'allowProviderWrites', ['mock', 'real'])
+  const draftSync = environment.SUPERLOCAL_DRAFT_SYNC ?? input.draftSync ?? 'import'
+  if (draftSync !== 'off' && draftSync !== 'import' && draftSync !== 'two-way') invalid('draftSync')
   const providers = record(input.providers, 'providers', [...PROVIDER_IDS])
   const mock = record(providers.mock, 'providers.mock', ['enabled'])
   const gmail = record(providers.gmail, 'providers.gmail', ['enabled', 'oauth'])
@@ -221,7 +225,7 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   return {
     configPath, instanceId: input.instanceId, mode: input.mode, dataDir,
     web: { port: webPort, origin: webOrigin, allowedOrigins: authMethod === 'google' ? [webOrigin] : [...new Set([webOrigin, `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`, ...allowedOrigins])] },
-    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails }, allowProviderWrites: policy[input.mode],
+    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails }, allowProviderWrites: policy[input.mode], draftSync,
     providers: { ...others, mock: { enabled: enabledMock }, inbound: { enabled: bool(inbound.enabled, 'providers.inbound.enabled') },
       imap: { enabled: bool(imap.enabled, 'providers.imap.enabled'), servers: imapServers }, gmail: {
       enabled: bool(gmail.enabled, 'providers.gmail.enabled'), oauth: {
