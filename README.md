@@ -226,6 +226,34 @@ Provider credentials are submitted to the host, encrypted per connection by the 
 
 Real connections default to normal mail access (`allowProviderWrites.real: true`). For an optional read-only host, set it to `false`; Gmail can use `https://www.googleapis.com/auth/gmail.readonly` with `openid` and `email` rather than modify/send scopes. Reauthorize old read-only grants before sending or modifying mail. Provider capabilities and OAuth permissions still determine which native actions are available.
 
+### Automatic sorting with a model provider
+
+Automatic sorting stays unavailable until the host has a model connection. Create `ai-inference.json` next to `superlocal.local.json`, or point `SUPERLOCAL_AI_CONFIG` at it. It must be a regular file you own with mode `600`; it is git-ignored and its key is never sent to the browser.
+
+The host speaks the OpenAI Responses protocol, so any compatible endpoint works. This example uses OpenRouter, where changing models means editing `models`:
+
+```json
+{
+  "version": 1,
+  "protocol": "openai-responses",
+  "name": "OpenRouter",
+  "endpoint": "https://openrouter.ai/api/v1/responses",
+  "apiKey": "<your key>",
+  "defaultModel": "anthropic/claude-haiku-5.5",
+  "models": [
+    { "id": "anthropic/claude-haiku-5.5", "label": "Claude Haiku 5.5", "pricing": {
+      "version": "openrouter-2026-11-16", "source": "https://openrouter.ai/api/v1/models", "currency": "USD",
+      "inputPerMillion": 0.1, "outputPerMillion": 0.5, "cachedInputPerMillion": 0.01, "cacheWriteInputPerMillion": 0.125 } }
+  ],
+  "reasoningEffort": "low",
+  "providerRouting": { "zeroDataRetention": true, "denyDataCollection": true, "requireParameters": true }
+}
+```
+
+- `models` is the list Settings offers. `pricing` is per million tokens and feeds only the local cost estimate; use `null` when a price is unknown.
+- `providerRouting` is optional and OpenRouter-specific: it is sent as the request's `provider` object. `zeroDataRetention` routes only to zero-retention endpoints, `denyDataCollection` excludes providers that may store or train on prompts, and `requireParameters` excludes providers that would ignore the JSON schema. Leave it out for endpoints that reject unknown fields. It limits where a request may go; it is not a statement about the provider's own terms.
+- Restart the host after editing the file, then open **Settings → AI triage**. Preview shows assessments without changing the inbox; Apply lets them sort mail. Nothing is sent to the provider while sorting is off.
+
 <details>
 <summary>Runtime storage and advanced local configuration</summary>
 

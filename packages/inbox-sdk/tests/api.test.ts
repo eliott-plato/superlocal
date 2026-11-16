@@ -12851,7 +12851,7 @@ describe('bounded thread ordering', () => {
   }, 30_000)
 })
 
-import { inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
+import { inferAiRule, inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from '../../../apps/local-host/src/ai-preferences'
 import { AI_INPUT_POLICY_VERSION, AI_PREFERENCE_VERSION, AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiScoreSignals, type AiTriageInput } from '../../../apps/shared/ai-triage'
 
@@ -12914,6 +12914,7 @@ describe('AI triage inference and local scoring', () => {
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, outputPerMillion: 1_000_001 } }] },
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, cachedInputPerMillion: 'free' } }] },
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, source: '' } }] },
+      { providerRouting: { zeroDataRetention: 'yes' } }, { providerRouting: { region: 'eu' } }, { providerRouting: [] }, { providerRouting: null },
     ]) {
       await writeFile(path, JSON.stringify({ ...configuration, ...change }))
       expect(() => loadAiInferenceConfig(path)).toThrow('AI_CONFIG_INVALID')
@@ -12972,6 +12973,53 @@ describe('AI triage inference and local scoring', () => {
     expect(validateAiAssessment(campaign, unicode)).toEqual(campaign)
     expect(validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toEqual(campaign)
     expect(() => validateAiAssessment(unknown, { ...input, messages: [...input.messages, ...input.messages] })).toThrow('AI_INPUT_INVALID')
+  })
+
+  test('provider routing is sent only when configured, and the policy names every evidence field the validator checks', async () => {
+    const routed: AiInferenceConfig = { ...configuration, providerRouting: { zeroDataRetention: true, denyDataCollection: true, requireParameters: true } }
+    const directory = await mkdtemp(join(TEMP_ROOT, 'ai-routing-test-'))
+    cleanup.push(() => rm(directory, { recursive: true, force: true }))
+    const path = join(directory, 'ai-inference.json')
+    await writeFile(path, JSON.stringify(routed), { mode: 0o600 })
+    expect(loadAiInferenceConfig(path)).toMatchObject(routed)
+    await writeFile(path, JSON.stringify(configuration))
+    expect(loadAiInferenceConfig(path)).not.toHaveProperty('providerRouting')
+    const bodies: Array<Record<string, unknown>> = []
+    const capture = (reply: unknown) => (async (_url: unknown, init?: RequestInit) => { bodies.push(JSON.parse(String(init?.body))); return Response.json(reply) }) as unknown as typeof fetch
+    const signal = new AbortController().signal
+    for (const [config, provider] of [
+      [configuration, undefined],
+      [{ ...configuration, providerRouting: {} }, undefined],
+      [{ ...configuration, providerRouting: { zeroDataRetention: false, denyDataCollection: false } }, undefined],
+      [{ ...configuration, providerRouting: { zeroDataRetention: true } }, { zdr: true }],
+      [routed, { zdr: true, data_collection: 'deny', require_parameters: true }],
+    ] as const) {
+      bodies.length = 0
+      expect((await inferAiTriage(input, config, { model: 'fixture-model', signal, fetcher: capture(response) })).outcome).toBe('completed')
+      const rule = { id: 'fixture-response', status: 'completed', usage, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text',
+        text: JSON.stringify({ text: 'Fixture vendor receipts are not important.', category: 'Other', supersedes: [] }) }] }] }
+      expect(await inferAiRule({ note: 'Receipts like this are not important', conversation: { subjects: ['Fixture receipt'], senderDomains: ['vendor.example.test'],
+        type: 'receipt', reason: null, topics: [], currentCategory: 'Important' } }, config, { model: 'fixture-model', signal, fetcher: capture(rule) }))
+        .toMatchObject({ outcome: 'completed', draft: { text: 'Fixture vendor receipts are not important.', category: 'Other', supersedes: [] } })
+      expect(bodies).toHaveLength(2)
+      for (const body of bodies) {
+        if (provider) expect(body.provider).toEqual(provider)
+        else expect(body).not.toHaveProperty('provider')
+      }
+    }
+    // The validator rejects an assessment that lacks evidence for an asserted field; the policy must say so for each one.
+    const policy = String(bodies[0]!.instructions)
+    for (const phrase of ['field type whenever type is anything except unknown or other', 'field response whenever response is needed', 'field action whenever actions is not empty',
+      'field task (quoting an incoming message) whenever task is required', 'field urgency whenever urgency is immediate or deadline',
+      'field risk whenever risk is unsolicited, spam_suspected or phishing_suspected']) expect(policy).toContain(phrase)
+    for (const [change, code] of [
+      [{ type: 'request', evidence: request.evidence.filter(item => item.field !== 'type') }, 'AI_EVIDENCE_REQUIRED'],
+      [{ evidence: request.evidence.filter(item => item.field !== 'response') }, 'AI_EVIDENCE_REQUIRED'],
+      [{ evidence: request.evidence.filter(item => item.field !== 'action') }, 'AI_EVIDENCE_REQUIRED'],
+      [{ evidence: request.evidence.filter(item => item.field !== 'task') }, 'AI_EVIDENCE_REQUIRED'],
+      [{ evidence: request.evidence.filter(item => item.field !== 'urgency') }, 'AI_EVIDENCE_REQUIRED'],
+      [{ risk: 'unsolicited' }, 'AI_EVIDENCE_REQUIRED'],
+    ] as const) expect(() => validateAiAssessment({ ...request, ...change }, input)).toThrow(code)
   })
 
   test('mail prompt injection remains user data with no tools, no storage, and strict grounded output', async () => {
