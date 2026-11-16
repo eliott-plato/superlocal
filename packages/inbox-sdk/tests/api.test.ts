@@ -1858,6 +1858,10 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
   const mutationReceipts = new Map<string, Array<Receipt<MailMessage | null, [MessageMutation, MailMessage]>>>()
   let sequence = 1
   let sent = 0
+  // Native drafts: each save is a new message ID, as in Gmail. Raw MIME is modeled as JSON.
+  type NativeDraft = { messageId: string; message: MailMessage; attachments: AttachmentData[] }
+  const drafts = new Map<string, NativeDraft>()
+  let draftVersion = 0, draftFailure: Error | undefined, beforeSnapshot: (() => void) | undefined
   const folderRows: ProviderFolder[] = ['inbox', 'sent', 'archive', 'trash', 'spam'].map(role => ({
     id: `native-folder-${role}`, name: role, folder: role,
   }))
@@ -1871,7 +1875,20 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
     send: [] as SendInput[],
     mutate: [] as Array<{ id: string; changes: MessageMutation }>,
     attachment: [] as Array<{ messageId: string; attachmentId: string; contentId?: string }>,
+    drafts: { list: 0, get: [] as string[], snapshot: [] as string[], create: [] as SendInput[], update: [] as Array<{ id: string; input: SendInput }>, delete: [] as string[], restore: 0 },
   }
+  const putDraft = (id: string, input: Partial<MailMessage>, files: Array<{ filename: string; contentType: string; content: Uint8Array }> = []) => {
+    const messageId = `${id}-v${++draftVersion}`
+    const attachments = files.map((file, index): AttachmentData => ({ attachment: { id: `${messageId}-a${index}`, filename: file.filename, contentType: file.contentType, size: file.content.byteLength, url: `native:${messageId}-a${index}` },
+      content: file.content.slice(), filename: file.filename, contentType: file.contentType }))
+    drafts.set(id, { messageId, attachments, message: native(messageId, { threadId: `draft-thread-${id}`, folder: 'drafts', from: participant(email), ...input, attachments: attachments.map(data => data.attachment) }) })
+    return messageId
+  }
+  const draftFromInput = (id: string, input: SendInput) => putDraft(id, {
+    from: recipients(input.from ?? email)[0]!, to: recipients(input.to), cc: recipients(input.cc), bcc: recipients(input.bcc), subject: input.subject,
+    bodyText: input.bodyText ?? input.text ?? '', bodyHtml: input.bodyHtml ?? input.html ?? '', ...(input.threadId ? { threadId: input.threadId } : {}),
+    ...(input.inReplyTo ? { inReplyTo: input.inReplyTo } : {}) }, (input.attachments ?? []).map(file => ({ filename: file.filename, contentType: file.contentType ?? 'application/octet-stream', content: file.content as Uint8Array })))
+  const draftRaw = (draft: NativeDraft) => new TextEncoder().encode(JSON.stringify({ to: draft.message.to, subject: draft.message.subject, bodyText: draft.message.bodyText }))
   const put = (message: MailMessage) => {
     messages.set(message.id, structuredClone(message))
     history.push({ sequence: ++sequence, message: structuredClone(message) })
@@ -1922,7 +1939,11 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
     })
   }
   return {
-    key, email, aliases, calls, put, remove, folderRows, customFolder,
+    key, email, aliases, calls, put, remove, folderRows, customFolder, drafts, putDraft,
+    dropDraft: (id: string) => { drafts.delete(id) },
+    failDrafts: (error?: Error) => { draftFailure = error },
+    /** Runs once inside the next snapshot read: an upstream edit racing a write-back. */
+    raceSnapshot: (hook: () => void) => { beforeSnapshot = hook },
     nextSync: (receipt: Receipt<SyncResult>) => { syncReceipts.push(receipt) },
     nextSend: (receipt: Receipt<SendResult, [SendInput]>) => { sendReceipts.push(receipt) },
     nextMutation: (id: string, receipt: Receipt<MailMessage | null, [MessageMutation, MailMessage]>) => {
@@ -2061,6 +2082,45 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
           const result = attachments.get(`${messageId}\0${attachmentId}`)
           if (!result) throw new ProviderNotFoundError(type, 'Missing upstream attachment')
           return structuredClone(result)
+        },
+        async listDrafts(cursor) {
+          calls.drafts.list++
+          if (draftFailure) throw draftFailure
+          const all = [...drafts].map(([id, draft]) => ({ id, messageId: draft.messageId }))
+          const offset = Number(cursor ?? 0)
+          return { drafts: all.slice(offset, offset + 2), nextCursor: offset + 2 < all.length ? String(offset + 2) : null }
+        },
+        async getDraft(id) {
+          calls.drafts.get.push(id)
+          const draft = drafts.get(id)
+          if (!draft) throw new ProviderNotFoundError(type, 'Missing upstream draft')
+          return { id, messageId: draft.messageId, message: { ...structuredClone(draft.message), accountId }, attachments: structuredClone(draft.attachments) }
+        },
+        async snapshotDraft(id) {
+          calls.drafts.snapshot.push(id)
+          const race = beforeSnapshot; beforeSnapshot = undefined; race?.()
+          const draft = drafts.get(id)
+          if (!draft) throw new ProviderNotFoundError(type, 'Missing upstream draft')
+          return { messageId: draft.messageId, raw: draftRaw(draft) }
+        },
+        async createDraft(input) {
+          const id = `native-draft-${++draftVersion}`
+          if ('raw' in input) {
+            calls.drafts.restore++
+            const value = JSON.parse(new TextDecoder().decode(input.raw)) as Pick<MailMessage, 'to' | 'subject' | 'bodyText'>
+            return { id, messageId: putDraft(id, value) }
+          }
+          calls.drafts.create.push(structuredClone(input))
+          return { id, messageId: draftFromInput(id, input) }
+        },
+        async updateDraft(id, input) {
+          calls.drafts.update.push({ id, input: structuredClone(input) })
+          if (!drafts.has(id)) throw new ProviderNotFoundError(type, 'Missing upstream draft')
+          return { id, messageId: draftFromInput(id, input) }
+        },
+        async deleteDraft(id) {
+          calls.drafts.delete.push(id)
+          if (!drafts.delete(id)) throw new ProviderNotFoundError(type, 'Missing upstream draft')
         },
         async disconnect() { calls.disconnect++ },
       }
@@ -8567,6 +8627,150 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     expect((await h.inbox.changes('alice', { since: baseline.state })).events).toEqual([])
     const stored = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], folder: 'sent', limit: 10 })).items.map(message => message.subject).sort()
     expect(stored).toEqual(['Subject mine', 'Subject old-sent', 'Subject oldest-sent'])
+  })
+
+  test('import mirrors native drafts locally and never writes upstream', async () => {
+    const h = await fixture({ syncIntervalMs: 1000, draftSync: 'import' })
+    const { account, box } = await h.connect('alice', 'drafts-import')
+    const poll = async () => { h.clock.value += 1001; await h.inbox.poll() }
+    const subjects = async () => (await h.inbox.drafts('alice', account.id)).map(draft => draft.subject).sort()
+    box.putDraft('d1', { to: [participant('client@example.test')], subject: 'Proposal', bodyText: 'Hello there', bodyHtml: '<p>Hello there</p>' },
+      [{ filename: 'q.txt', contentType: 'text/plain', content: new TextEncoder().encode('quarterly numbers') }])
+    box.putDraft('d2', { subject: 'Second', bodyText: 'Two' })
+    box.putDraft('d3', { subject: 'Third', bodyText: 'Three' })
+    await poll()
+    expect(await subjects()).toEqual(['Proposal', 'Second', 'Third'])
+    const drafts = await h.inbox.drafts('alice', account.id)
+    const proposal = drafts.find(draft => draft.subject === 'Proposal')!
+    expect(proposal).toMatchObject({ to: [{ email: 'client@example.test' }], bodyText: 'Hello there', mode: 'compose', status: 'active', from: 'drafts-import@example.test' })
+    expect(new TextDecoder().decode((await h.inbox.download('alice', proposal.attachmentIds[0]!)).content)).toBe('quarterly numbers')
+    // Unchanged native versions are not fetched again.
+    const reads = box.calls.drafts.get.length
+    await poll()
+    expect(box.calls.drafts.get).toHaveLength(reads)
+    // A native edit follows into an unedited local copy, reusing unchanged attachment bytes.
+    box.putDraft('d1', { to: [participant('client@example.test')], subject: 'Proposal v2', bodyText: 'Hello again' },
+      [{ filename: 'q.txt', contentType: 'text/plain', content: new TextEncoder().encode('quarterly numbers') }])
+    await poll()
+    expect(await h.inbox.draft('alice', proposal.id)).toMatchObject({ subject: 'Proposal v2', revision: proposal.revision + 1, attachmentIds: proposal.attachmentIds })
+    box.putDraft('d1', { to: [participant('client@example.test')], subject: 'Proposal v2', bodyText: 'Hello again' })
+    await poll()
+    expect((await h.inbox.draft('alice', proposal.id)).attachmentIds).toEqual([])
+    // Edited on both sides: keep both. Local edits are never pushed in import mode.
+    const second = drafts.find(draft => draft.subject === 'Second')!
+    await h.inbox.updateDraft('alice', second.id, { subject: 'Second, edited here' }, second.revision)
+    box.putDraft('d2', { subject: 'Second, edited upstream', bodyText: 'Two' })
+    await poll()
+    expect(await subjects()).toEqual(['Proposal v2', 'Second, edited here', 'Second, edited upstream', 'Third'])
+    // A failed listing retires nothing.
+    box.failDrafts(new ProviderError(FULL, 'UPSTREAM', 'Drafts unavailable', { retryable: true }))
+    box.dropDraft('d1')
+    await poll()
+    expect(await subjects()).toEqual(['Proposal v2', 'Second, edited here', 'Second, edited upstream', 'Third'])
+    // Gone upstream: unedited copies go, the locally edited one stays.
+    box.failDrafts()
+    box.dropDraft('d2')
+    await poll()
+    expect(await subjects()).toEqual(['Second, edited here', 'Third'])
+    // A local delete hides the native draft until it changes upstream.
+    const third = (await h.inbox.drafts('alice', account.id)).find(draft => draft.subject === 'Third')!
+    await h.inbox.deleteDraft('alice', third.id, third.revision)
+    await poll()
+    expect(await subjects()).toEqual(['Second, edited here'])
+    box.putDraft('d3', { subject: 'Third, changed upstream', bodyText: 'Three' })
+    await poll()
+    expect(await subjects()).toEqual(['Second, edited here', 'Third, changed upstream'])
+    expect([...box.drafts.keys()]).toEqual(['d3'])
+    expect(box.calls.drafts).toMatchObject({ snapshot: [], create: [], update: [], delete: [], restore: 0 })
+    expect(box.calls.send).toEqual([])
+    expect(await h.inbox.draftBackups('alice')).toEqual([])
+  })
+
+  test('two-way writes back only settled visible edits over the version last seen, backs up, and never sends', async () => {
+    const h = await fixture({ syncIntervalMs: 1000, draftSync: 'two-way' })
+    const { account, box } = await h.connect('alice', 'drafts-two-way')
+    const poll = async (ms = 1001) => { h.clock.value += ms; await h.inbox.poll() }
+    const find = async (subject: string) => (await h.inbox.drafts('alice', account.id)).find(draft => draft.subject === subject)!
+    box.putDraft('d1', { to: [participant('client@example.test')], subject: 'Offer', bodyText: 'Draft body', bodyHtml: '<p>Draft <b>body</b></p>' },
+      [{ filename: 'terms.pdf', contentType: 'application/pdf', content: new TextEncoder().encode('signed terms') }])
+    await poll()
+    const offer = await find('Offer')
+    // An HTML-only re-save, like the editor normalizing on open, is not an edit worth pushing.
+    const resaved = await h.inbox.updateDraft('alice', offer.id, { bodyHtml: '<div>Draft body</div>' }, offer.revision)
+    await poll(10_001)
+    expect(box.calls.drafts.update).toEqual([])
+    // A real edit waits to settle, then replaces the version last seen after backing it up.
+    const edited = await h.inbox.updateDraft('alice', offer.id, { bodyText: 'Revised body', bodyHtml: '<p>Revised body</p>' }, resaved.revision)
+    await poll()
+    expect(box.calls.drafts.update).toEqual([])
+    await poll(10_000)
+    expect(box.calls.drafts.update).toHaveLength(1)
+    const pushed = box.calls.drafts.update[0]!
+    expect(pushed).toMatchObject({ id: 'd1', input: { subject: 'Offer', bodyText: 'Revised body', to: [{ email: 'client@example.test' }], threadId: 'draft-thread-d1' } })
+    expect(new TextDecoder().decode(pushed.input.attachments![0]!.content as Uint8Array)).toBe('signed terms')
+    expect(await h.inbox.draftBackups('alice')).toMatchObject([{ accountId: account.id, reason: 'update' }])
+    // Superlocal's own version is neither re-imported nor backed up again.
+    const reads = box.calls.drafts.get.length
+    const again = await h.inbox.updateDraft('alice', offer.id, { bodyText: 'Revised twice', bodyHtml: '<p>Revised twice</p>' }, edited.revision)
+    await poll(10_001)
+    expect(box.calls.drafts.update).toHaveLength(2)
+    expect(box.calls.drafts.get).toHaveLength(reads)
+    expect(await h.inbox.draftBackups('alice')).toHaveLength(1)
+    // Changed upstream while writing back: no overwrite. Keep both, the local edit as a new native draft.
+    await h.inbox.updateDraft('alice', offer.id, { subject: 'Offer, final here' }, again.revision)
+    box.raceSnapshot(() => box.putDraft('d1', { to: [participant('client@example.test')], subject: 'Offer, final upstream', bodyText: 'Their wording' }))
+    await poll(10_001)
+    expect(box.calls.drafts.update).toHaveLength(2)
+    expect(box.drafts.get('d1')!.message.subject).toBe('Offer, final upstream')
+    expect(box.calls.drafts.create).toEqual([])
+    await poll()
+    expect(box.calls.drafts.update).toHaveLength(2)
+    expect(box.calls.drafts.create.map(input => input.subject)).toEqual(['Offer, final here'])
+    expect([...box.drafts.values()].map(draft => draft.message.subject).sort()).toEqual(['Offer, final here', 'Offer, final upstream'])
+    // A local delete removes the native draft only if unchanged, after a backup.
+    const upstream = await find('Offer, final upstream')
+    await h.inbox.deleteDraft('alice', upstream.id, upstream.revision)
+    await poll()
+    expect(box.calls.drafts.delete).toEqual(['d1'])
+    expect((await h.inbox.draftBackups('alice')).map(backup => backup.reason)).toEqual(['deleted', 'update'])
+    box.putDraft('d9', { subject: 'Keep me', bodyText: 'Nine' })
+    await poll()
+    const keep = await find('Keep me')
+    await h.inbox.deleteDraft('alice', keep.id, keep.revision)
+    box.raceSnapshot(() => box.putDraft('d9', { subject: 'Keep me, changed upstream', bodyText: 'Nine' }))
+    await poll()
+    expect(box.calls.drafts.delete).toEqual(['d1'])
+    await poll()
+    expect(await find('Keep me, changed upstream')).toBeDefined()
+    // An emptied draft is never pushed over its native version.
+    const kept = await find('Keep me, changed upstream')
+    await h.inbox.updateDraft('alice', kept.id, { to: [], cc: [], bcc: [], subject: '', bodyText: '', bodyHtml: '' }, kept.revision)
+    await poll(10_001)
+    expect(box.drafts.get('d9')!.message.subject).toBe('Keep me, changed upstream')
+    // Nothing above sent mail. A failed send keeps the native draft; a confirmed one retires it.
+    expect(box.calls.send).toEqual([])
+    box.putDraft('d5', { to: [participant('client@example.test')], subject: 'Ready', bodyText: 'Send me' })
+    await poll()
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    box.nextSend(new ProviderError(FULL, 'VALIDATION', 'Rejected', { retryable: false }))
+    const failed = await h.submit('alice', await find('Ready'), 'ready-failed')
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', failed.id)).status).toBe('failed')
+    await poll()
+    expect(box.drafts.has('d5')).toBe(true)
+    const sent = await h.submit('alice', await find('Ready'), 'ready-sent')
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', sent.id)).status).toBe('succeeded')
+    await poll()
+    expect(box.drafts.has('d5')).toBe(false)
+    expect(box.calls.send.map(input => input.subject)).toEqual(['Ready', 'Ready'])
+    expect((await h.inbox.draftBackups('alice')).map(backup => backup.reason)).toEqual(['sent', 'deleted', 'update'])
+    // Backups restore as new native drafts, which import like any other.
+    const deleted = (await h.inbox.draftBackups('alice')).find(backup => backup.reason === 'deleted')!
+    await h.inbox.restoreDraftBackup('alice', deleted.id)
+    await poll()
+    expect(box.calls.drafts.restore).toBe(1)
+    expect(await find('Offer, final upstream')).toMatchObject({ bodyText: 'Their wording' })
   })
 
   test('built-in Gmail and mock skip sync hints while other definitions retain the default', () => {

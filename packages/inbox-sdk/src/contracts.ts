@@ -157,6 +157,9 @@ export interface InboxOptions {
   concurrency?: number
   log?: (event: { code: string; operation: string }) => void
   allowProviderWrites?: boolean
+  /** Native provider drafts. off (default) leaves them alone; import mirrors them locally without
+   * writing upstream; two-way also writes local edits/deletes back, conditionally and with backups. */
+  draftSync?: 'off' | 'import' | 'two-way'
   /** Host defaults for owners without a saved policy; saved user choices always win. */
   defaultPolicy?: Partial<Policy>
   /** Trusted host callback returning complete, usable credentials for this connection. */
@@ -532,6 +535,14 @@ export interface Draft extends Required<Omit<DraftInput, 'sourceMessageId' | 'ma
   updatedAt: string
 }
 
+export interface DraftBackup {
+  id: string
+  accountId: string
+  reason: 'update' | 'deleted' | 'sent'
+  createdAt: string
+  size: number
+}
+
 export interface Changes extends MessageMutation {
   /** SDK-local labels, never forwarded to a provider. */
   addLabelIds?: string[]
@@ -660,6 +671,10 @@ export interface Inbox {
   draft(owner: string, id: string): Promise<Draft>
   updateDraft(owner: string, id: string, input: Partial<DraftInput>, revision: number): Promise<Draft>
   deleteDraft(owner: string, id: string, revision: number): Promise<void>
+  /** Native drafts saved before an overwrite or delete, kept for 30 days. */
+  draftBackups(owner: string, accountId?: string): Promise<DraftBackup[]>
+  /** Recreates a backed-up native draft as a new draft; it never sends. */
+  restoreDraftBackup(owner: string, id: string): Promise<void>
   submit(owner: string, id: string, input: { revision: number; idempotencyKey: string; sendAt?: string }): Promise<Operation>
   mutate(owner: string, input: MutationInput): Promise<Operation>
   operation(owner: string, id: string): Promise<Operation>

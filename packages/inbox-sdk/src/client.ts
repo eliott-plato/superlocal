@@ -1,4 +1,4 @@
-import type { BlobInfo, ChangeEvent, Draft, DraftInput, Inbox, Label, MailboxInput, MailboxQuery, MailboxSnapshotInput, MailboxSnapshotPage, MutationInput, Policy, Query, SyncRequest } from './contracts'
+import type { BlobInfo, ChangeEvent, Draft, DraftBackup, DraftInput, Inbox, Label, MailboxInput, MailboxQuery, MailboxSnapshotInput, MailboxSnapshotPage, MutationInput, Policy, Query, SyncRequest } from './contracts'
 
 export interface InboxClientOptions {
   /** API origin or same-origin mount path, without /v1. */
@@ -595,6 +595,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     draft: (id: string, requestOptions: InboxRequestOptions = {}) => request<Draft>(`/drafts/${resourceId(id)}`, requestOptions),
     updateDraft: (id: string, input: Partial<DraftInput>, revision: number, requestOptions: InboxRequestOptions = {}) => conditional<Draft>(`/drafts/${resourceId(id)}`, revision, 'PATCH', input, requestOptions),
     deleteDraft: (id: string, revision: number, requestOptions: InboxRequestOptions = {}) => conditional<void>(`/drafts/${resourceId(id)}`, revision, 'DELETE', undefined, requestOptions),
+    draftBackups: (accountId?: string, requestOptions: InboxRequestOptions = {}) => request<DraftBackup[]>(`/draft-backups${queryString({ accountId })}`, requestOptions),
+    restoreDraftBackup: (id: string, requestOptions: InboxRequestOptions = {}) => write<void>(`/draft-backups/${resourceId(id)}/restore`, 'POST', {}, requestOptions),
     submit: (id: string, input: Parameters<Inbox['submit']>[2], requestOptions: InboxRequestOptions = {}) => {
       const { idempotencyKey, ...payload } = input
       return write<Result<'submit'>>(`/drafts/${resourceId(id)}/submit`, 'POST', payload, requestOptions, { 'Idempotency-Key': idempotencyKey })

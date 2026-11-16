@@ -9,9 +9,9 @@ import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
 import { FORWARDING_BODY_BYTES, FORWARDING_DEPTH, forwardingRfcId, isForwardedCopy, type ForwardingBody, type ForwardingMessage } from './forwarding'
-import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
+import { ProviderError, ProviderMutationError, htmlToPlainText, type InboxProvider, type MailAccount, type MailMessage, type ProviderDraft, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSyncStatus, type MailboxSyncProblemCode, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
-  type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
+  type DraftBackup, type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
@@ -91,6 +91,9 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE TABLE IF NOT EXISTS sdk_labels (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, data TEXT NOT NULL, FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
     CREATE TABLE IF NOT EXISTS sdk_blobs (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, data TEXT NOT NULL, content BLOB, message_id TEXT, attachment_id TEXT, UNIQUE(account,generation,message_id,attachment_id), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
     CREATE TABLE IF NOT EXISTS sdk_drafts (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, data TEXT NOT NULL, FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
+    CREATE TABLE IF NOT EXISTS sdk_native_drafts (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, draft TEXT NOT NULL, message_id TEXT NOT NULL, synced_revision INTEGER NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
+    CREATE INDEX IF NOT EXISTS sdk_native_draft_local ON sdk_native_drafts(account,draft);
+    CREATE TABLE IF NOT EXISTS sdk_draft_backups (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, native_id TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL, raw BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS sdk_operations (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, status TEXT NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL, payload TEXT NOT NULL, fingerprint TEXT NOT NULL, key TEXT NOT NULL, lease TEXT, lease_until INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, UNIQUE(owner,key), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
     CREATE INDEX IF NOT EXISTS sdk_operation_due ON sdk_operations(status,next_at,seq);
     CREATE TABLE IF NOT EXISTS sdk_checkpoints (account TEXT NOT NULL, generation INTEGER NOT NULL, scope TEXT NOT NULL, lane TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,scope,lane));
@@ -1806,6 +1809,8 @@ export function createInbox(options: InboxOptions): Inbox {
           }
           op.results = [{ messageId: mid, status: 'succeeded' }]
           saveOperation(row, op)
+          // Only a provider-confirmed send retires the native draft copy.
+          db.query("UPDATE sdk_native_drafts SET state='sent' WHERE account=? AND draft=? AND state='linked'").run(account.id, draft.id)
           event(row.owner, 'draft.updated', account.id, draft.id)
         })
         return
@@ -2082,7 +2087,7 @@ export function createInbox(options: InboxOptions): Inbox {
           db.query('UPDATE sdk_connections SET generation=?,status=?,data=?,credentials=?,credential_version=credential_version+1 WHERE id=? AND owner=? AND generation=?').run(grant.generation, grant.status, JSON.stringify(grant), crypto.encryptCredential(JSON.stringify(storedCredentials), owner, grant.id), grant.id, owner, oldGrant.generation)
           db.query('UPDATE sdk_accounts SET generation=?,status=?,data=?,native=?,credentials=\'\' WHERE id=? AND owner=?').run(account.generation, account.status, JSON.stringify(account), JSON.stringify(native), id, owner)
           // A credential generation fences in-flight work; it does not replace mailbox identity.
-          for (const table of ['sdk_messages', 'sdk_blobs', 'sdk_folders', 'sdk_thread_keys', 'sdk_native_keys', 'sdk_checkpoints']) db.query(`UPDATE ${table} SET generation=? WHERE account=? AND generation=?`).run(account.generation, id, old.generation)
+          for (const table of ['sdk_messages', 'sdk_blobs', 'sdk_folders', 'sdk_thread_keys', 'sdk_native_keys', 'sdk_checkpoints', 'sdk_native_drafts']) db.query(`UPDATE ${table} SET generation=? WHERE account=? AND generation=?`).run(account.generation, id, old.generation)
           db.query('DELETE FROM sdk_checkpoints WHERE account=?').run(id)
           db.query('DELETE FROM sdk_cooldowns WHERE account=?').run(id)
           const active = db.query<OperationRow, [string]>("SELECT * FROM sdk_operations WHERE account=? AND status='processing'").all(id)
@@ -2156,6 +2161,168 @@ export function createInbox(options: InboxOptions): Inbox {
       if (connectionRow(owner, id).credential_version !== version) throw new InboxError('PRECONDITION_FAILED', 'Connection credentials have changed.', 412)
       return publicCredentialState(saveCredentials(original, credentials, true, profiles))
     } finally { await Promise.allSettled(created.map(provider => provider.disconnect())) }
+  }
+
+  // Native draft mirror. Import never writes upstream. Two-way writes only over the native version last
+  // seen, backs that version up first unless Superlocal wrote it, never pushes an emptied draft, and has
+  // no send path: a draft is sent only by submit, and its native copy is removed after a confirmed send.
+  type NativeDraftRow = { account: string; generation: number; native_id: string; draft: string; message_id: string; synced_revision: number; state: 'linked' | 'deleted' | 'sent'; data: string }
+  type NativeDraftData = { threadId?: string; inReplyTo?: string; references?: string[]; content: string; pushed?: boolean }
+  const DRAFT_SETTLE_MS = 10_000, DRAFT_BACKUP_MS = 30 * 86_400_000, DRAFT_PAGES = 20
+  const draftText = (draft: Pick<Draft, 'bodyText' | 'bodyHtml'>) => draft.bodyHtml ? htmlToPlainText(draft.bodyHtml) : draft.bodyText
+  /** What a reader sees. HTML-only normalization (e.g. the editor re-saving on open) is not an edit worth pushing. */
+  const draftContent = (draft: Draft) => JSON.stringify([draft.from.toLowerCase(), ...[draft.to, draft.cc, draft.bcc].map(list => list.map(p => p.email.toLowerCase())),
+    draft.subject, draftText(draft).replace(/\s+/g, ''), draft.attachmentIds])
+  const emptyDraft = (draft: Draft) => !draft.to.length && !draft.cc.length && !draft.bcc.length && !draft.subject.trim() && !draftText(draft).trim() && !draft.attachmentIds.length
+  const nativeDrafts = (row: AccountRow) => db.query<NativeDraftRow, [string, number]>('SELECT * FROM sdk_native_drafts WHERE account=? AND generation=?').all(row.id, row.generation)
+  const nativeDraft = (row: AccountRow, nativeId: string) => db.query<NativeDraftRow, [string, number, string]>('SELECT * FROM sdk_native_drafts WHERE account=? AND generation=? AND native_id=?').get(row.id, row.generation, nativeId)
+  const localDraft = (owner: string, id: string) => { const stored = db.query<DataRow, [string, string]>('SELECT * FROM sdk_drafts WHERE owner=? AND id=?').get(owner, id); return stored ? JSON.parse(stored.data) as Draft : undefined }
+  function linkDraft(row: AccountRow, nativeId: string, draft: Draft, messageId: string, data: NativeDraftData, state: NativeDraftRow['state'] = 'linked'): void {
+    db.query('INSERT INTO sdk_native_drafts VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(account,generation,native_id) DO UPDATE SET draft=excluded.draft,message_id=excluded.message_id,synced_revision=excluded.synced_revision,state=excluded.state,data=excluded.data')
+      .run(row.id, row.generation, nativeId, draft.id, messageId, draft.revision, state, JSON.stringify(data))
+  }
+  function backupDraft(row: AccountRow, nativeId: string, reason: DraftBackup['reason'], raw: Uint8Array): void {
+    db.query('DELETE FROM sdk_draft_backups WHERE created_at<?').run(now() - DRAFT_BACKUP_MS)
+    db.query('INSERT INTO sdk_draft_backups VALUES (?,?,?,?,?,?,?)').run(randomUUID(), row.owner, row.id, nativeId, reason, now(), raw)
+  }
+
+  /** Adopts one native draft version, inside a transaction. Unrepresentable drafts stay untouched upstream. */
+  function adoptNativeDraft(row: AccountRow, native: ProviderDraft): void {
+    const mail = native.message
+    if (native.attachments.length > 20 || native.attachments.reduce((size, data) => size + data.content.byteLength, 0) > 25 * 1024 * 1024) throw new InboxError('TOO_LARGE', 'Native draft attachments exceed local draft limits.', 413)
+    const link = nativeDraft(row, native.id)
+    const local = link?.state === 'linked' ? localDraft(row.owner, link.draft) : undefined
+    // Unedited locally: follow the native change. Edited on both sides: keep both, the native one as a new draft.
+    const replace = local && link && local.status === 'active' && local.revision === link.synced_revision ? local : undefined
+    const source = mail.inReplyTo ? db.query<{ id: string }, [string, number, string]>("SELECT id FROM sdk_messages WHERE account=? AND generation=? AND deleted=0 AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)=?").get(row.id, row.generation, mail.inReplyTo) : null
+    // Native saves re-list unchanged attachments; reuse identical bytes rather than storing another copy.
+    const previous = (replace?.attachmentIds ?? []).flatMap(id => db.query<BlobRow, [string, string]>('SELECT * FROM sdk_blobs WHERE id=? AND owner=? AND content IS NOT NULL').all(id, row.owner))
+    const blobs = native.attachments.map(data => {
+      const same = previous.find(blob => (JSON.parse(blob.data) as BlobInfo).filename === (data.filename || data.attachment.filename || 'attachment') && Buffer.from(blob.content!).equals(Buffer.from(data.content)))
+      if (same) return JSON.parse(same.data) as BlobInfo
+      const info: BlobInfo = { id: randomUUID(), accountId: row.id, filename: data.filename || data.attachment.filename || 'attachment', contentType: data.contentType || 'application/octet-stream',
+        size: data.content.byteLength, ...(data.attachment.inline ? { inline: true } : {}), ...(data.attachment.contentId ? { contentId: data.attachment.contentId } : {}) }
+      db.query('INSERT INTO sdk_blobs(id,owner,account,generation,data,content) VALUES (?,?,?,?,?,?)').run(info.id, row.owner, row.id, row.generation, JSON.stringify(info), data.content)
+      return info
+    })
+    const value = validateDraft(row.owner, { accountId: row.id, ...(mail.from.email ? { from: mail.from.email } : {}), to: mail.to, cc: mail.cc, bcc: mail.bcc ?? [],
+      subject: mail.subject, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachmentIds: blobs.map(blob => blob.id),
+      ...(source ? { mode: 'reply' as const, sourceMessageId: source.id } : { mode: 'compose' as const }) })
+    const updatedAt = new Date(now()).toISOString()
+    const draft: Draft = replace ? { ...value, id: replace.id, revision: replace.revision + 1, status: 'active', updatedAt } : { ...value, id: randomUUID(), revision: 1, status: 'active', updatedAt }
+    if (replace) db.query('UPDATE sdk_drafts SET data=? WHERE id=? AND owner=?').run(JSON.stringify(draft), draft.id, row.owner)
+    else db.query('INSERT INTO sdk_drafts VALUES (?,?,?,?)').run(draft.id, row.owner, row.id, JSON.stringify(draft))
+    event(row.owner, 'draft.updated', row.id, draft.id, replace ? 'updated' : 'created')
+    linkDraft(row, native.id, draft, native.messageId, { threadId: mail.threadId, ...(mail.inReplyTo ? { inReplyTo: mail.inReplyTo } : {}), references: mail.references ?? [], content: draftContent(draft) })
+  }
+
+  async function nativeDraftInput(row: AccountRow, draft: Draft, data?: NativeDraftData): Promise<SendInput> {
+    const attachments: NonNullable<SendInput['attachments']> = []
+    for (const blobId of draft.attachmentIds) {
+      const { info, content } = await inbox.download(row.owner, blobId)
+      attachments.push({ filename: info.filename, content, contentType: info.contentType, contentId: info.contentId, inline: info.inline })
+    }
+    let reply: Pick<SendInput, 'threadId' | 'inReplyTo' | 'references'> = { threadId: data?.threadId, inReplyTo: data?.inReplyTo, references: data?.references }
+    if (draft.sourceMessageId && ['reply', 'replyAll'].includes(draft.mode)) {
+      const source = messageRow(row.owner, draft.sourceMessageId); const body = JSON.parse(source.body)
+      reply = { threadId: db.query<{ native_id: string }, [string, number, string]>('SELECT native_id FROM sdk_thread_keys WHERE account=? AND generation=? AND id=?').get(row.id, row.generation, source.thread_id)?.native_id ?? data?.threadId,
+        inReplyTo: body.rfcMessageId, references: [...body.references ?? [], ...body.rfcMessageId ? [body.rfcMessageId] : []] }
+    }
+    return { accountId: row.id, from: draft.from, to: draft.to, cc: draft.cc, bcc: draft.bcc, subject: draft.subject,
+      ...(draft.bodyText ? { bodyText: draft.bodyText } : {}), ...(draft.bodyHtml ? { bodyHtml: draft.bodyHtml } : {}), attachments,
+      ...(reply.threadId ? { threadId: reply.threadId } : {}), ...(reply.inReplyTo ? { inReplyTo: reply.inReplyTo } : {}), ...(reply.references?.length ? { references: reply.references } : {}) }
+  }
+
+  async function syncDrafts(row: AccountRow): Promise<void> {
+    const mode = options.draftSync ?? 'off'
+    if (mode === 'off') return
+    const before = new Map(nativeDrafts(row).map(link => [link.native_id, link]))
+    const listed = new Map<string, string>()
+    // Only a complete, successful listing may retire anything; any failure leaves every draft as it is.
+    const complete = await io(row, async provider => {
+      if (!provider.listDrafts || !provider.getDraft) return false
+      let cursor: string | null = null
+      for (let page = 0; page < DRAFT_PAGES; page++) {
+        const result = await provider.listDrafts(cursor)
+        for (const ref of result.drafts) listed.set(ref.id, ref.messageId)
+        if (!(cursor = result.nextCursor)) return true
+      }
+      return false
+    })
+    if (!complete || !current(row)) return
+    const skip = (error: unknown) => {
+      const code = error instanceof InboxError || error instanceof ProviderError ? error.code : 'UNKNOWN'
+      options.log?.({ code: /^[A-Z][A-Z0-9_]{0,79}$/.test(code) ? `DRAFT_${code}` : 'DRAFT_SKIPPED', operation: 'drafts' })
+    }
+    for (const [nativeId, messageId] of listed) {
+      if (nativeDraft(row, nativeId)?.message_id === messageId) continue
+      try {
+        const native = await io(row, provider => provider.getDraft!(nativeId))
+        if (!current(row)) return
+        transaction(() => adoptNativeDraft(row, native))
+      } catch (error) { if (!(error instanceof ProviderError && error.code === 'NOT_FOUND')) skip(error) }
+    }
+    transaction(() => {
+      for (const link of before.values()) {
+        if (listed.has(link.native_id) || nativeDraft(row, link.native_id)?.message_id !== link.message_id) continue
+        // Gone upstream (deleted or sent elsewhere). A local copy without local edits goes too; an edited one stays local.
+        const local = link.state === 'linked' ? localDraft(row.owner, link.draft) : undefined
+        if (local?.status === 'active' && local.revision === link.synced_revision) {
+          db.query('DELETE FROM sdk_drafts WHERE owner=? AND id=?').run(row.owner, local.id); event(row.owner, 'draft.updated', row.id, local.id, 'deleted')
+        }
+        db.query('DELETE FROM sdk_native_drafts WHERE account=? AND generation=? AND native_id=?').run(row.id, row.generation, link.native_id)
+      }
+    })
+    if (mode !== 'two-way' || options.allowProviderWrites === false) return
+    const settled = (draft: Draft) => draft.status === 'active' && Date.parse(draft.updatedAt) <= now() - DRAFT_SETTLE_MS
+    for (const link of nativeDrafts(row)) {
+      if (listed.get(link.native_id) !== link.message_id) continue
+      const local = link.state === 'linked' ? localDraft(row.owner, link.draft) : undefined
+      try {
+        if (link.state !== 'linked') {
+          // Deleted locally, or sent through Superlocal: remove the native copy only if it is still the version last seen.
+          const snapshot = await io(row, provider => provider.snapshotDraft!(link.native_id))
+          if (snapshot.messageId !== link.message_id || !current(row)) continue
+          transaction(() => backupDraft(row, link.native_id, link.state === 'sent' ? 'sent' : 'deleted', snapshot.raw))
+          await io(row, provider => provider.deleteDraft!(link.native_id))
+          transaction(() => db.query('DELETE FROM sdk_native_drafts WHERE account=? AND generation=? AND native_id=? AND message_id=?').run(row.id, row.generation, link.native_id, link.message_id))
+          continue
+        }
+        if (!local || !settled(local) || local.revision <= link.synced_revision) continue
+        const data = JSON.parse(link.data) as NativeDraftData
+        if (draftContent(local) === data.content || emptyDraft(local)) {
+          // Nothing a reader would see changed, or the draft was emptied: record it locally, never overwrite upstream.
+          if (!emptyDraft(local)) transaction(() => db.query('UPDATE sdk_native_drafts SET synced_revision=? WHERE account=? AND generation=? AND native_id=? AND message_id=?').run(local.revision, row.id, row.generation, link.native_id, link.message_id))
+          continue
+        }
+        const input = await nativeDraftInput(row, local, data)
+        const snapshot = await io(row, provider => provider.snapshotDraft!(link.native_id))
+        if (snapshot.messageId !== link.message_id || !current(row)) continue
+        if (!data.pushed) transaction(() => backupDraft(row, link.native_id, 'update', snapshot.raw))
+        const ref = await io(row, provider => provider.updateDraft!(link.native_id, input))
+        transaction(() => {
+          if (nativeDraft(row, link.native_id)?.message_id !== link.message_id) return
+          if (ref.id !== link.native_id) db.query('DELETE FROM sdk_native_drafts WHERE account=? AND generation=? AND native_id=?').run(row.id, row.generation, link.native_id)
+          linkDraft(row, ref.id, local, ref.messageId, { threadId: input.threadId, inReplyTo: input.inReplyTo, references: input.references ?? [], content: draftContent(local), pushed: true })
+        })
+      } catch (error) { skip(error) }
+    }
+    const linked = new Set(nativeDrafts(row).map(link => link.draft))
+    for (const stored of db.query<DataRow, [string, string]>('SELECT * FROM sdk_drafts WHERE owner=? AND account=?').all(row.owner, row.id)) {
+      const local = JSON.parse(stored.data) as Draft
+      if (linked.has(local.id) || !settled(local) || emptyDraft(local)) continue
+      try {
+        const input = await nativeDraftInput(row, local)
+        if (!current(row)) return
+        const ref = await io(row, provider => provider.createDraft!(input))
+        transaction(() => {
+          // Discarded while it was being created: the next pass removes the new native copy.
+          const latest = localDraft(row.owner, local.id)
+          linkDraft(row, ref.id, local, ref.messageId, { threadId: input.threadId, inReplyTo: input.inReplyTo, references: input.references ?? [], content: draftContent(local), pushed: true },
+            latest?.status === 'active' ? 'linked' : 'deleted')
+        })
+      } catch (error) { skip(error) }
+    }
   }
 
   function synchronizeSource(owner: string, id: string, request: SyncRequest = {}, mailboxScoped = false): Promise<{ synchronized: number; hasMore: boolean; state: string }> {
@@ -2350,7 +2517,7 @@ export function createInbox(options: InboxOptions): Inbox {
         const account: Account = { ...JSON.parse(row.data), status: 'disconnected', generation: row.generation + 1 }
         account.revision += 1
         db.query('UPDATE sdk_accounts SET status=?,generation=?,data=?,credentials=? WHERE owner=? AND id=?').run(account.status, account.generation, JSON.stringify(account), '', owner, id)
-        for (const table of ['sdk_messages', 'sdk_blobs', 'sdk_folders', 'sdk_thread_keys', 'sdk_native_keys', 'sdk_checkpoints']) db.query(`UPDATE ${table} SET generation=? WHERE account=? AND generation=?`).run(account.generation, id, row.generation)
+        for (const table of ['sdk_messages', 'sdk_blobs', 'sdk_folders', 'sdk_thread_keys', 'sdk_native_keys', 'sdk_checkpoints', 'sdk_native_drafts']) db.query(`UPDATE ${table} SET generation=? WHERE account=? AND generation=?`).run(account.generation, id, row.generation)
         const pending = db.query<OperationRow, [string, string]>("SELECT * FROM sdk_operations WHERE owner=? AND account=? AND status IN ('pending','processing')").all(owner, id)
         for (const job of pending) {
           const op = JSON.parse(job.data) as Operation
@@ -3107,7 +3274,28 @@ export function createInbox(options: InboxOptions): Inbox {
       if (draft.revision !== revision) throw new InboxError('PRECONDITION_FAILED', 'The draft was modified.', 412)
       if (draft.status !== 'active') throw new InboxError('CONFLICT', 'Cancel the submission before discarding its draft.', 409)
       db.query('DELETE FROM sdk_drafts WHERE owner=? AND id=?').run(owner, id); event(owner, 'draft.updated', draft.accountId, id, 'deleted')
+      // Two-way removes the native copy later, only if unchanged; import keeps it hidden until it changes upstream.
+      db.query("UPDATE sdk_native_drafts SET state='deleted' WHERE account=? AND draft=? AND state='linked'").run(draft.accountId, id)
     })),
+    draftBackups: (owner, accountId) => run(() => {
+      ownerId(owner); if (accountId) accountRow(owner, accountId)
+      return db.query<{ id: string; account: string; reason: DraftBackup['reason']; created_at: number; size: number }, [string, string | null, string | null, number]>(
+        'SELECT id,account,reason,created_at,length(raw) size FROM sdk_draft_backups WHERE owner=? AND (? IS NULL OR account=?) AND created_at>=? ORDER BY created_at DESC')
+        .all(owner, accountId ?? null, accountId ?? null, now() - DRAFT_BACKUP_MS)
+        .map(row => ({ id: row.id, accountId: row.account, reason: row.reason, createdAt: new Date(row.created_at).toISOString(), size: row.size }))
+    }),
+    restoreDraftBackup: (owner, id) => run(async () => {
+      if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
+      ownerId(owner)
+      const backup = db.query<{ account: string; raw: Uint8Array }, [string, string, number]>('SELECT account,raw FROM sdk_draft_backups WHERE owner=? AND id=? AND created_at>=?').get(owner, id, now() - DRAFT_BACKUP_MS)
+      if (!backup) throw new InboxError('NOT_FOUND', 'Draft backup not found.', 404)
+      const account = accountRow(owner, backup.account, true)
+      // A new native draft; the next poll imports it like any other.
+      await io(account, async provider => {
+        if (!provider.createDraft) throw new InboxError('UNSUPPORTED_OPERATION', 'This account has no native drafts.', 409)
+        await provider.createDraft({ raw: new Uint8Array(backup.raw) })
+      })
+    }),
 
     submit: (owner, id, input) => run(async () => {
       if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
@@ -3325,6 +3513,7 @@ export function createInbox(options: InboxOptions): Inbox {
             // folders follow a started inbox import in order; one backfill page per poll.
             const next = backfill('inbox') && folders.find(folder => { const checkpoint = backfill(folder); return checkpoint ? !!checkpoint.cursor : folder !== 'inbox' })
             if (next) await synchronizeSource(row.owner, row.id, { folder: next, lane: 'backfill' }, true)
+            await syncDrafts(accountRow(row.owner, row.id, true))
           }, catch: failure,
         }).pipe(Effect.catchAll(error => Effect.sync(() => options.log?.({ code: error.code, operation: 'sync' })))), { concurrency, discard: true }))
       }).finally(() => { polling = undefined })

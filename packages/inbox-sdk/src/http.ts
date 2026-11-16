@@ -240,6 +240,7 @@ const schemas = {
   DraftInput: draftInput,
   DraftPatch: draftInput.partial().refine((value) => Object.keys(value).length > 0),
   Draft: draftInput.required().extend({ id, revision, sourceMessageId: id.optional(), mailboxId: id.optional(), status: z.enum(['active', 'submitted']), updatedAt: z.string() }),
+  DraftBackup: z.object({ id, accountId: id, reason: z.enum(['update', 'deleted', 'sent']), createdAt: z.string(), size: revision }),
   Submit: z.strictObject({ revision, sendAt: date.optional() }),
   Mutation: z.strictObject({ messageIds: z.array(id).min(1).max(500), changes: changesInput, ifRevisions: z.record(id, revision).optional(), viaMailboxId: id.optional() }),
   Operation: z.object({
@@ -852,6 +853,8 @@ export function createInboxApi(options: InboxApiOptions) {
     await inbox.deleteDraft(c.get('owner'), current.id, current.revision)
     return c.newResponse(null, 204)
   })
+  route('get', '/v1/draft-backups', { summary: 'List native drafts backed up before an overwrite or delete (30 days)', query: accountQuery, output: 'DraftBackup[]' }, async (c) => json(c, await inbox.draftBackups(c.get('owner'), query(c, accountQuery).accountId)))
+  route('post', '/v1/draft-backups/:id/restore', { summary: 'Recreate a backed-up native draft as a new draft; never sends', status: 204 }, async (c) => { await inbox.restoreDraftBackup(c.get('owner'), pathId(c)); return c.newResponse(null, 204) })
   route('post', '/v1/drafts/:id/submit', { summary: 'Queue a draft for sending', input: 'Submit', output: 'Operation', status: 202, idempotent: true }, async (c) => json(c, await inbox.submit(c.get('owner'), pathId(c), { ...body(c, schemas.Submit), idempotencyKey: idempotencyKey(c) }), 202))
   route('post', '/v1/operations', { summary: 'Queue a message mutation', input: 'Mutation', output: 'Operation', status: 202, idempotent: true }, async (c) => json(c, await inbox.mutate(c.get('owner'), { ...body(c, schemas.Mutation), idempotencyKey: idempotencyKey(c) }), 202))
   route('get', '/v1/operations/:id', { summary: 'Get an operation', output: 'Operation' }, async (c) => json(c, await inbox.operation(c.get('owner'), pathId(c))))
