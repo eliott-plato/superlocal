@@ -13286,7 +13286,7 @@ describe('AI triage inference and local scoring', () => {
     expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 0 })
     expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: 0 })
     // Calendar invitations, updates and cancellations need no reply but still stay Important, with or without personalization.
-    for (const subject of ['Invitation: Fictional planning sync', 'Canceled event: Fictional planning sync']) {
+    for (const subject of ['Invitation: Fictional planning sync', 'Canceled event: Fictional planning sync', 'Accepted: Fictional planning sync']) {
       const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject, text: 'Fictional event details.' }] }
       const invitation = validateAiAssessment({ ...base, type: 'invitation', evidence: [{ messageRef: 'message-1', quote: subject, field: 'type' }] }, source)
       for (const personalization of [true, false]) {

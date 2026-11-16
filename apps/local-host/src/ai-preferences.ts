@@ -25,7 +25,7 @@ export function countAiTopicMatches(topics: unknown, interests: unknown): number
 
 /** A decision table, not a confidence model. Numeric values retain the saved-score
  * contract: before a manual override, 20 means Important, 0 means Other, and -100 records suspected risk.
- * Calendar invitations, updates and cancellations are Important unless suspected spam/phishing or unsolicited.
+ * Calendar invitations, RSVP replies, updates and cancellations are Important unless suspected spam/phishing or unsolicited.
  * Reading time and correspondence volume never turn routine mail into a task.
  */
 export function scoreAiTriage(
@@ -40,8 +40,8 @@ export function scoreAiTriage(
   if (assessment.risk === 'spam_suspected' || assessment.risk === 'phishing_suspected') {
     decide(-100, 'risk_gate', 'Suspected spam or phishing remains Other');
   } else if (assessment.type === 'invitation' && assessment.risk !== 'unsolicited') {
-    // Calendar mail (invitations, updates, reschedules, cancellations) changes the user's schedule even when no reply is asked.
-    decide(20, 'calendar_gate', 'A calendar invitation, update or cancellation stays Important');
+    // Calendar mail (invitations, RSVP replies, updates, reschedules, cancellations) concerns the user's schedule even when no reply is asked.
+    decide(20, 'calendar_gate', 'Calendar mail (invitation, reply, update or cancellation) stays Important');
   } else if (assessment.certainty !== 'clear' || assessment.type === 'unknown' ||
     assessment.response === 'unknown' || assessment.task === 'unknown' || assessment.task === undefined) {
     decide(20, 'uncertainty_gate', 'Uncertain or legacy assessment stays Important for review');
