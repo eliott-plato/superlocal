@@ -3761,6 +3761,72 @@ describe('Gmail sending identities', () => {
   })
 })
 
+describe('Gmail native drafts', () => {
+  test('draft hooks page, read every attachment, write conditionally scoped MIME and never reach a send endpoint', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const base = '/gmail/v1/users/me'
+    const requests: Array<{ method: string; path: string; search: string; body?: any }> = []
+    const native = { id: 'draft-msg-1', threadId: 'thread-1', labelIds: ['DRAFT'], internalDate: '1767225600000', payload: { mimeType: 'multipart/mixed', headers: [
+      { name: 'From', value: PRIMARY }, { name: 'To', value: 'client@example.test' }, { name: 'Subject', value: 'Offer' }, { name: 'In-Reply-To', value: '<source@example.test>' },
+    ], parts: [
+      { partId: '0', mimeType: 'text/plain', body: { data: Buffer.from('Draft text').toString('base64url') } },
+      { partId: '1', mimeType: 'application/pdf', filename: 'terms.pdf', headers: [{ name: 'Content-Disposition', value: 'attachment' }], body: { attachmentId: 'att-1', size: 12 } },
+    ] } }
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      const method = init?.method ?? 'GET'
+      requests.push({ method, path: url.pathname, search: url.search, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) })
+      if (url.pathname.includes('/send')) throw new Error('A draft hook reached a send endpoint')
+      if (method === 'GET' && url.pathname === `${base}/drafts`) return Response.json(url.searchParams.get('pageToken') === 'p2'
+        ? { drafts: [{ id: 'r2', message: { id: 'draft-msg-2', threadId: 'thread-2' } }] }
+        : { drafts: [{ id: 'r1', message: { id: 'draft-msg-1', threadId: 'thread-1' } }], nextPageToken: 'p2' })
+      if (method === 'GET' && url.pathname === `${base}/drafts/r1`) return Response.json(url.searchParams.get('format') === 'raw'
+        ? { id: 'r1', message: { id: 'draft-msg-1', raw: Buffer.from('Subject: Offer\r\n\r\nDraft text').toString('base64url') } } : { id: 'r1', message: native })
+      if (method === 'GET' && url.pathname === `${base}/messages/draft-msg-1`) return Response.json(native)
+      if (method === 'GET' && url.pathname === `${base}/messages/draft-msg-1/attachments/att-1`) return Response.json({ data: Buffer.from('signed terms').toString('base64url') })
+      if (method === 'POST' && url.pathname === `${base}/drafts`) return Response.json({ id: 'r3', message: { id: 'draft-msg-3', threadId: 'thread-1' } })
+      if (method === 'PUT' && url.pathname === `${base}/drafts/r1`) return Response.json({ id: 'r1', message: { id: 'draft-msg-4', threadId: 'thread-1' } })
+      if (method === 'DELETE' && url.pathname === `${base}/drafts/r1`) return new Response(null, { status: 204 })
+      throw new Error(`Unexpected draft request ${method} ${url.pathname}`)
+    }) as typeof fetch
+    const credentials = { accountId: 'gmail-drafts', accessToken: 'offline-token', email: PRIMARY, baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher }
+    const provider = await definition.create({ ...credentials, scopes: ['https://www.googleapis.com/auth/gmail.modify'] })
+    const sendOnly = await definition.create({ ...credentials, scopes: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'] })
+    try {
+      const first = await provider.listDrafts!()
+      expect(first).toEqual({ drafts: [{ id: 'r1', messageId: 'draft-msg-1' }], nextCursor: 'p2' })
+      expect((await provider.listDrafts!(first.nextCursor)).drafts).toEqual([{ id: 'r2', messageId: 'draft-msg-2' }])
+      const draft = await provider.getDraft!('r1')
+      expect(draft).toMatchObject({ id: 'r1', messageId: 'draft-msg-1', message: { subject: 'Offer', bodyText: 'Draft text', folder: 'drafts', threadId: 'thread-1', inReplyTo: '<source@example.test>' } })
+      expect(draft.attachments.map(data => [data.filename, Buffer.from(data.content).toString()])).toEqual([['terms.pdf', 'signed terms']])
+      const snapshot = await provider.snapshotDraft!('r1')
+      expect([snapshot.messageId, Buffer.from(snapshot.raw).toString()]).toEqual(['draft-msg-1', 'Subject: Offer\r\n\r\nDraft text'])
+      const input: SendInput = { from: PRIMARY, to: ['client@example.test'], subject: 'Offer v2', bodyText: 'Revised', threadId: 'thread-1', inReplyTo: '<source@example.test>',
+        attachments: [{ filename: 'terms.pdf', content: new TextEncoder().encode('signed terms'), contentType: 'application/pdf' }] }
+      expect(await provider.createDraft!(input)).toEqual({ id: 'r3', messageId: 'draft-msg-3' })
+      expect(await provider.updateDraft!('r1', input)).toEqual({ id: 'r1', messageId: 'draft-msg-4' })
+      for (const write of requests.filter(request => ['POST', 'PUT'].includes(request.method))) {
+        expect(write.body.message.threadId).toBe('thread-1')
+        const mime = Buffer.from(write.body.message.raw, 'base64url').toString()
+        for (const part of ['Subject: Offer v2', 'In-Reply-To: <source@example.test>', 'filename=terms.pdf', Buffer.from('signed terms').toString('base64')]) expect(mime).toContain(part)
+      }
+      expect(requests.find(request => request.method === 'PUT')!.body.id).toBe('r1')
+      const raw = new TextEncoder().encode('Subject: Restored\r\n\r\nBody')
+      await provider.createDraft!({ raw })
+      expect(Buffer.from(requests.at(-1)!.body.message.raw, 'base64url').toString()).toBe('Subject: Restored\r\n\r\nBody')
+      await provider.deleteDraft!('r1')
+      expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `${base}/drafts/r1` })
+      // gmail.send alone may read drafts but never change them.
+      const before = requests.length
+      await failure(() => sendOnly.createDraft!(input), 'UNSUPPORTED_OPERATION', false)
+      await failure(() => sendOnly.updateDraft!('r1', input), 'UNSUPPORTED_OPERATION', false)
+      await failure(() => sendOnly.deleteDraft!('r1'), 'UNSUPPORTED_OPERATION', false)
+      expect(requests).toHaveLength(before)
+      expect(requests.some(request => request.path.includes('/send'))).toBe(false)
+    } finally { await Promise.all([provider.disconnect(), sendOnly.disconnect()]) }
+  })
+})
+
 describe('Gmail read-only body and pagination regressions', () => {
   test('explicit HTML UTF-8 declarations override legacy MIME only for valid original UTF-8 bytes', async () => {
     const definition = builtInProviders.find(provider => provider.id === 'gmail')!

@@ -33,6 +33,8 @@ import {
   type MailThread,
   type MessageMutation,
   type ProviderCapabilities,
+  type ProviderDraft,
+  type ProviderDraftRef,
   type ProviderCredentials,
   type ProviderFolder,
   type ProviderListResult,
@@ -78,6 +80,12 @@ interface GmailMessage {
   internalDate?: string
   historyId?: string
   payload?: GmailPart
+  raw?: string
+}
+
+interface GmailDraft {
+  id: string
+  message?: GmailMessage
 }
 
 interface GmailListResponse {
@@ -922,6 +930,18 @@ export class GmailProvider implements InboxProvider {
     }
     if (!this.capabilities.send) throw new UnsupportedOperationError('gmail', 'sending with the granted OAuth scopes')
     if (input.scheduledAt) throw new UnsupportedOperationError('gmail', 'scheduled sending')
+    const { source, messageId } = await this.compose(input)
+    const sent = await this.request<GmailMessage>('/users/me/messages/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        raw: encodeBase64Url(source),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+      }),
+    })
+    return { id: sent.id, providerMessageId: sent.id, threadId: sent.threadId, messageId }
+  }
+
+  private async compose(input: SendInput): Promise<{ source: Buffer; messageId: string }> {
     const from = input.from ?? this.credentials.email
     if (!from) throw new ProviderError('gmail', 'VALIDATION', 'A sender email address is required')
 
@@ -947,15 +967,64 @@ export class GmailProvider implements InboxProvider {
     })
     const source = result.message
     if (!Buffer.isBuffer(source)) throw new ProviderError('gmail', 'UPSTREAM', 'Failed to compose a MIME message')
+    return { source, messageId: result.messageId }
+  }
 
-    const sent = await this.request<GmailMessage>('/users/me/messages/send', {
-      method: 'POST',
-      body: JSON.stringify({
-        raw: encodeBase64Url(source),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-      }),
-    })
-    return { id: sent.id, providerMessageId: sent.id, threadId: sent.threadId, messageId: result.messageId }
+  // Draft hooks never call a send endpoint. Writes need gmail.modify or gmail.compose; gmail.send is not enough.
+  private draftWrites(): void {
+    const scopes = this.credentials.scopes
+    if (scopes !== undefined && !scopes.some(scope => ['https://mail.google.com/', 'https://www.googleapis.com/auth/gmail.modify',
+      'https://www.googleapis.com/auth/gmail.compose'].includes(scope))) throw new UnsupportedOperationError('gmail', 'draft changes with the granted OAuth scopes')
+  }
+
+  private draftRef(draft: GmailDraft): ProviderDraftRef {
+    if (typeof draft?.id !== 'string' || typeof draft.message?.id !== 'string') throw new ProviderError('gmail', 'UPSTREAM', 'Gmail returned an invalid draft')
+    return { id: draft.id, messageId: draft.message.id }
+  }
+
+  async listDrafts(cursor?: string | null): Promise<{ drafts: ProviderDraftRef[]; nextCursor: string | null }> {
+    const params = new URLSearchParams({ maxResults: '100' })
+    if (cursor) params.set('pageToken', cursor)
+    const page = await this.request<{ drafts?: GmailDraft[]; nextPageToken?: string }>(`/users/me/drafts?${params}`)
+    return { drafts: (page.drafts ?? []).map(draft => this.draftRef(draft)), nextCursor: page.nextPageToken ?? null }
+  }
+
+  async getDraft(draftId: string): Promise<ProviderDraft> {
+    const draft = await this.request<GmailDraft>(`/users/me/drafts/${encodeURIComponent(draftId)}?format=full`)
+    const ref = this.draftRef(draft)
+    const message = await this.normalize(draft.message!)
+    // One attachment at a time keeps a large draft's memory bounded.
+    const attachments: AttachmentData[] = []
+    for (const attachment of message.attachments) attachments.push(await this.getAttachment(message.id, attachment.id, attachment.contentId, attachment))
+    return { ...ref, message, attachments }
+  }
+
+  async snapshotDraft(draftId: string): Promise<{ messageId: string; raw: Uint8Array }> {
+    const draft = await this.request<GmailDraft>(`/users/me/drafts/${encodeURIComponent(draftId)}?format=raw`)
+    const ref = this.draftRef(draft)
+    if (typeof draft.message!.raw !== 'string') throw new ProviderError('gmail', 'UPSTREAM', 'Gmail returned a draft without its content')
+    return { messageId: ref.messageId, raw: new Uint8Array(decodeBase64Url(draft.message!.raw)) }
+  }
+
+  async createDraft(input: SendInput | { raw: Uint8Array; threadId?: string }): Promise<ProviderDraftRef> {
+    this.draftWrites()
+    const raw = 'raw' in input ? Buffer.from(input.raw) : (await this.compose(input)).source
+    return this.draftRef(await this.request<GmailDraft>('/users/me/drafts', {
+      method: 'POST', body: JSON.stringify({ message: { raw: encodeBase64Url(raw), ...(input.threadId ? { threadId: input.threadId } : {}) } }),
+    }))
+  }
+
+  async updateDraft(draftId: string, input: SendInput): Promise<ProviderDraftRef> {
+    this.draftWrites()
+    const { source } = await this.compose(input)
+    return this.draftRef(await this.request<GmailDraft>(`/users/me/drafts/${encodeURIComponent(draftId)}`, {
+      method: 'PUT', body: JSON.stringify({ id: draftId, message: { raw: encodeBase64Url(source), ...(input.threadId ? { threadId: input.threadId } : {}) } }),
+    }))
+  }
+
+  async deleteDraft(draftId: string): Promise<void> {
+    this.draftWrites()
+    await this.request<void>(`/users/me/drafts/${encodeURIComponent(draftId)}`, { method: 'DELETE' })
   }
 
   async mutate(messageId: string, mutation: MessageMutation): Promise<MailMessage | null> {

@@ -182,6 +182,18 @@ export interface SendingIdentity {
   isDefault: boolean
 }
 
+export interface ProviderDraftRef {
+  id: string
+  /** Changes on every native save; the SDK treats it as the draft's version. */
+  messageId: string
+}
+
+export interface ProviderDraft extends ProviderDraftRef {
+  message: MailMessage
+  /** Every attachment's bytes; a draft is only representable with all of them. */
+  attachments: AttachmentData[]
+}
+
 export interface InboxProvider {
   readonly type: InboxProviderType
   readonly accountId: string
@@ -201,6 +213,15 @@ export interface InboxProvider {
   mutate(messageId: string, mutation: MessageMutation): Promise<MailMessage | null>
   getAttachment(messageId: string, attachmentId: string, contentId?: string,
     metadata?: Pick<Attachment, 'filename' | 'contentType' | 'inline'>): Promise<AttachmentData>
+  /** Native drafts. Providers without them omit every draft hook; none of them sends mail. */
+  listDrafts?(cursor?: string | null): Promise<{ drafts: ProviderDraftRef[]; nextCursor: string | null }>
+  getDraft?(draftId: string): Promise<ProviderDraft>
+  /** The current version and raw MIME, read immediately before a conditional write and kept as a backup. */
+  snapshotDraft?(draftId: string): Promise<{ messageId: string; raw: Uint8Array }>
+  createDraft?(input: SendInput | { raw: Uint8Array; threadId?: string }): Promise<ProviderDraftRef>
+  updateDraft?(draftId: string, input: SendInput): Promise<ProviderDraftRef>
+  /** Permanent on providers such as Gmail: callers back the draft up first. */
+  deleteDraft?(draftId: string): Promise<void>
   disconnect(): Promise<void>
 }
 
