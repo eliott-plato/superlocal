@@ -158,7 +158,7 @@ const schemas = {
     revision, connectionId: id.optional(),
   }),
   SendingIdentities: z.strictObject({ sourceId: id, identities: z.array(z.strictObject({
-    email: z.string().min(1).max(1024), isPrimary: z.boolean(), isDefault: z.boolean(),
+    email: z.string().min(1).max(1024), isPrimary: z.boolean(), isDefault: z.boolean(), signature: z.string().max(256 * 1024).optional(),
   })).max(100), checkedAt: date.nullable() }),
   Connection: z.object({
     id, providerId: name, name: z.string(), status: z.enum(['connected', 'disconnected', 'reconnect_required']),

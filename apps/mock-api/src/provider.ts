@@ -125,8 +125,11 @@ export class MockInboxProvider implements InboxProvider {
   async identities() {
     this.open()
     const account = this.store.assertScope(this.scope)
+    const html = (value: string) => value.replace(/[&<>"]/g, char => `&#${char.charCodeAt(0)};`)
+    // A fictional per-address HTML signature, like the ones Gmail keeps for each sending address.
     const sending = [account.email, ...(account.aliases ?? [])].map(email => ({ email,
-      isPrimary: email.toLowerCase() === account.email.toLowerCase(), isDefault: email.toLowerCase() === account.email.toLowerCase() }))
+      isPrimary: email.toLowerCase() === account.email.toLowerCase(), isDefault: email.toLowerCase() === account.email.toLowerCase(),
+      signature: `<div><b>${html(account.name || email)}</b><br><span style="color:#5f6368">${html(email)}</span> · <a href="https://${html(email.split('@')[1]!)}">${html(email.split('@')[1]!)}</a></div>` }))
     const domains = [...new Set(sending.map(identity => identity.email.split('@')[1]!))]
     return { sending, receiving: [
       ...sending.map(identity => ({ kind: 'address' as const, value: identity.email, canReceive: true, canSend: true, canFilter: true })),

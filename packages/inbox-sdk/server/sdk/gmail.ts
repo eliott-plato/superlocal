@@ -680,8 +680,9 @@ export class GmailProvider implements InboxProvider {
     const primary = this.credentials.email
     if (primary !== undefined && !validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'Invalid expected primary email address')
     const result = await this.request<unknown>(
-      '/users/me/settings/sendAs?fields=sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)',
-      { method: 'GET' }, 64 * 1024,
+      '/users/me/settings/sendAs?fields=sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus,signature)',
+      // Each signature may hold up to 10,000 characters of HTML.
+      { method: 'GET' }, 2 * 1024 * 1024,
     )
     const invalid = () => new ProviderError('gmail', 'UPSTREAM', 'Gmail returned invalid sending identities')
     if (!result || typeof result !== 'object' || Array.isArray(result) || !('sendAs' in result) ||
@@ -697,7 +698,8 @@ export class GmailProvider implements InboxProvider {
       if (!validAddress(entry.sendAsEmail) ||
         entry.isPrimary !== undefined && typeof entry.isPrimary !== 'boolean' ||
         entry.isDefault !== undefined && typeof entry.isDefault !== 'boolean' ||
-        entry.verificationStatus !== undefined && typeof entry.verificationStatus !== 'string') throw invalid()
+        entry.verificationStatus !== undefined && typeof entry.verificationStatus !== 'string' ||
+        entry.signature !== undefined && typeof entry.signature !== 'string') throw invalid()
       // Gmail may omit false flags. Do not coerce other values or infer primary/default from each other.
       const isPrimary = entry.isPrimary === true
       const isDefault = entry.isDefault === true
@@ -714,6 +716,7 @@ export class GmailProvider implements InboxProvider {
       if (isDefault && ++defaultCount > 1) throw invalid()
       if (isPrimary || entry.verificationStatus === 'accepted') identities.push({
         email: isPrimary ? primary ?? entry.sendAsEmail : entry.sendAsEmail, isPrimary, isDefault,
+        ...(typeof entry.signature === 'string' && entry.signature.trim() ? { signature: entry.signature } : {}),
       })
     }
     if (primaryCount !== 1) throw invalid()

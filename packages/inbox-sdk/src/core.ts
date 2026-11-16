@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 'effect'
 import { createCredentialCrypto } from '../server/crypto'
-import { sanitizeEmailBody } from '../server/sanitize'
+import { sanitizeEmailBody, sanitizeSignatureHtml } from '../server/sanitize'
 import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
@@ -1132,11 +1132,14 @@ export function createInbox(options: InboxOptions): Inbox {
     const seen = new Set<string>(), primary = (native.email ?? '').trim().toLowerCase()
     const identities: SendingIdentity[] = offered.map(identity => {
       if (!identity || typeof identity.email !== 'string' || identity.email.length > 1024 || /[\x00-\x1f\x7f]/.test(identity.email)
-        || typeof identity.isPrimary !== 'boolean' || typeof identity.isDefault !== 'boolean') throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+        || typeof identity.isPrimary !== 'boolean' || typeof identity.isDefault !== 'boolean'
+        || identity.signature !== undefined && typeof identity.signature !== 'string') throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
       const email = identity.email.trim(), normalized = email.toLowerCase()
       if (!/^[^\s<>@]+@[^\s<>@]+$/.test(email) || seen.has(normalized)) throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
       seen.add(normalized)
-      return { email, isPrimary: identity.isPrimary, isDefault: identity.isDefault }
+      // Providers return raw HTML; only the sanitized form ever leaves the SDK. Oversized or empty signatures are dropped.
+      const signature = identity.signature ? sanitizeSignatureHtml(identity.signature) : ''
+      return { email, isPrimary: identity.isPrimary, isDefault: identity.isDefault, ...(signature ? { signature } : {}) }
     })
     if (identities.filter(identity => identity.isPrimary).length > 1 || identities.filter(identity => identity.isDefault).length > 1) {
       throw new InboxError('INVALID_PROVIDER', 'Conflicting sending identities.', 502)

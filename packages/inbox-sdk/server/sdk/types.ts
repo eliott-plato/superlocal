@@ -180,6 +180,8 @@ export interface SendingIdentity {
   email: string
   isPrimary: boolean
   isDefault: boolean
+  /** The provider's HTML signature for this address. The SDK sanitizes it before returning it. */
+  signature?: string
 }
 
 export interface ProviderDraftRef {

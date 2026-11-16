@@ -202,23 +202,36 @@ const liveDetail = (code: string) => code === "STREAM_LIMIT"
 function draftHtml(value: string): string {
   const template = document.createElement("template");
   template.innerHTML = value;
-  const allowed = new Set(["P", "DIV", "BR", "SPAN", "STRONG", "B", "EM", "I", "U", "S", "STRIKE", "BLOCKQUOTE", "UL", "OL", "LI", "PRE", "CODE", "A", "HR", "TABLE", "TBODY", "THEAD", "TR", "TD", "TH", "IMG"]);
+  const allowed = new Set(["P", "DIV", "BR", "SPAN", "STRONG", "B", "EM", "I", "U", "S", "STRIKE", "FONT", "BLOCKQUOTE", "UL", "OL", "LI", "PRE", "CODE", "A", "HR", "TABLE", "TBODY", "THEAD", "TR", "TD", "TH", "IMG"]);
+  // Layout and font attributes that signatures (and the editor's own colour command) rely on.
+  const kept: Record<string, readonly string[]> = { FONT: ["color", "face", "size"], TABLE: ["cellpadding", "cellspacing", "border", "width"],
+    TD: ["colspan", "rowspan", "align", "valign", "width"], TH: ["colspan", "rowspan", "align", "valign", "width"], IMG: ["width", "height"] };
   for (const node of Array.from(template.content.querySelectorAll("*"))) {
     if (["SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "SVG", "MATH", "TEMPLATE", "LINK", "META", "INPUT", "BUTTON", "TEXTAREA"].includes(node.tagName)) { node.remove(); continue; }
     if (!allowed.has(node.tagName)) { node.replaceWith(...node.childNodes); continue; }
     const href = node.getAttribute("href"), src = node.getAttribute("src"), alt = node.getAttribute("alt");
-    const styles = node instanceof HTMLElement ? ["color", "background-color", "font-weight", "font-style", "text-decoration", "text-align"].flatMap(property => {
+    // The composer marks the signature block; its https images come from the provider's sanitized signature.
+    const signature = node.tagName === "DIV" && node.classList.contains("gmail_signature");
+    const attributes = (kept[node.tagName] ?? []).flatMap(name => {
+      const value = node.getAttribute(name);
+      return value && /^[\w\s#%.,'"-]{1,100}$/.test(value) ? [[name, value]] : [];
+    });
+    const styles = node instanceof HTMLElement ? ["color", "background-color", "font-weight", "font-style", "font-size", "font-family", "text-decoration", "text-align", "line-height", "vertical-align", "width", "height"].flatMap(property => {
       const value = node.style.getPropertyValue(property);
       return value && !/url|expression|var\(/i.test(value) ? [[property, value]] : [];
     }) : [];
     for (const attribute of Array.from(node.attributes)) node.removeAttribute(attribute.name);
     if (node instanceof HTMLElement) for (const [property, value] of styles) node.style.setProperty(property, value);
+    for (const [name, value] of attributes) node.setAttribute(name, value);
+    if (signature) node.setAttribute("class", "gmail_signature");
     if (node.tagName === "A" && href && /^(https?:|mailto:)/i.test(href)) {
       node.setAttribute("href", href); node.setAttribute("target", "_blank"); node.setAttribute("rel", "noopener noreferrer");
     }
     if (node.tagName === "IMG") {
-      if (!src || !/^(\/v1\/blobs\/[A-Za-z0-9_-]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)$/.test(src)) node.remove();
-      else { node.setAttribute("src", src); if (alt) node.setAttribute("alt", alt); }
+      const local = !!src && /^(\/v1\/blobs\/[A-Za-z0-9_-]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)$/.test(src);
+      const signed = !!src && /^https:\/\/[^\s"'<>]+$/i.test(src) && !!node.parentElement?.closest(".gmail_signature");
+      if (!local && !signed) node.remove();
+      else { node.setAttribute("src", src!); if (alt) node.setAttribute("alt", alt); }
     }
   }
   return template.innerHTML;

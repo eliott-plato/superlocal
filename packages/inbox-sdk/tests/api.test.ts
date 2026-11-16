@@ -7589,6 +7589,12 @@ describe('source-scoped sending identities', () => {
     const primary = 'primary@example.test', alias = 'accepted@example.test', pending = 'pending@example.test'
     const calls: string[] = [], sent: string[] = []
     let responsePrimary = primary
+    // Fictional Gmail signature HTML carrying every unsafe construct the SDK must strip before the composer sees it.
+    const hostileSignature = '<div dir="ltr" class="gmail_signature" onclick="steal()"><b style="color:#1a73e8;background:url(https://track.example.test/bg)">Primary Person</b>'
+      + '<script>alert(1)</script><style>b{color:red}</style><br><a href="javascript:alert(1)">bad</a> <a href="https://example.test/about" target="_blank">site</a>'
+      + '<img src="https://images.example.test/logo.png" width="120" height="40" alt="Logo" onerror="steal()">'
+      + '<img src="https://track.example.test/pixel.gif" width="1" height="1"><img src="http://insecure.example.test/a.png"><img src="data:image/png;base64,AAAA">'
+      + '<form><input value="x"></form><iframe src="https://example.test/frame"></iframe></div>'
     const h = await fixture({ providers: [builtInProviders.find(provider => provider.id === 'gmail')!],
       fetch: (async (input, init) => {
         const request = new Request(input, init), url = new URL(request.url)
@@ -7598,9 +7604,9 @@ describe('source-scoped sending identities', () => {
         if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/profile') return Response.json({ emailAddress: primary })
         if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/labels/INBOX') return Response.json({ messagesUnread: 0 })
         if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/settings/sendAs') {
-          expect(url.searchParams.get('fields')).toBe('sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)')
+          expect(url.searchParams.get('fields')).toBe('sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus,signature)')
           return Response.json({ sendAs: [
-            { sendAsEmail: responsePrimary, isPrimary: true, isDefault: true, verificationStatus: 'accepted' },
+            { sendAsEmail: responsePrimary, isPrimary: true, isDefault: true, verificationStatus: 'accepted', signature: hostileSignature },
             { sendAsEmail: alias, isPrimary: false, isDefault: false, verificationStatus: 'accepted' },
             { sendAsEmail: pending, isPrimary: false, isDefault: false, verificationStatus: 'pending' },
           ] })
@@ -7623,9 +7629,17 @@ describe('source-scoped sending identities', () => {
     expect(response.status).toBe(200)
     expect(response.headers.get('cache-control')).toBe('no-store')
     const identities = await response.json() as SendingIdentities
+    const signature = identities.identities[0]!.signature!
     expect(identities).toEqual({ sourceId: account.id, checkedAt: new Date(EPOCH).toISOString(), identities: [
-      { email: primary, isPrimary: true, isDefault: true }, { email: alias, isPrimary: false, isDefault: false },
+      { email: primary, isPrimary: true, isDefault: true, signature }, { email: alias, isPrimary: false, isDefault: false },
     ] })
+    // Formatting, the https link and the sized https logo survive; scripts, handlers, classes, url() styles,
+    // javascript:/http:/data: sources, tracking pixels, forms and frames do not.
+    expect(signature).toContain('<b style="color:#1a73e8">Primary Person</b>')
+    expect(signature).toContain('<a href="https://example.test/about">site</a>')
+    expect(signature).toMatch(/<img src="https:\/\/images\.example\.test\/logo\.png" alt="Logo" width="120" height="40" ?\/?>/)
+    for (const unsafe of ['script', 'alert', '<style', 'steal', 'onclick', 'onerror', 'class=', 'url(', 'javascript:', 'track.example.test',
+      'insecure.example.test', 'data:', '<form', '<input', '<iframe', 'target=']) expect(signature).not.toContain(unsafe)
     expect(await client.sendingIdentities(account.id)).toEqual(identities)
     await client.setPolicy({ undoSendSeconds: 0 })
     const draft = await client.createDraft({ accountId: account.id, from: alias, to: [participant('recipient@example.test')], subject: 'Fictional token-only send' })
@@ -7646,10 +7660,10 @@ describe('source-scoped sending identities', () => {
     const unverified = await client.createDraft({ accountId: account.id, from: pending, to: [participant('recipient@example.test')] })
     await expect(client.submit(unverified.id, { revision: unverified.revision, idempotencyKey: 'token-only-pending' })).rejects.toMatchObject({ code: 'FORBIDDEN_SENDER', status: 403 })
     responsePrimary = primary.toUpperCase()
-    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true })
+    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true, signature })
     expect(h.logs.filter(log => log.code === 'SENDING_PRIMARY_ALIAS')).toEqual([])
     responsePrimary = 'canonical-alias@example.test'
-    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true })
+    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true, signature })
     expect(h.logs.filter(log => log.code === 'SENDING_PRIMARY_ALIAS')).toEqual([{ code: 'SENDING_PRIMARY_ALIAS', operation: 'identities' }])
     expect((await client.account(account.id)).email).toBe(primary)
     expect(sent).toHaveLength(2)
@@ -7708,8 +7722,10 @@ describe('source-scoped sending identities', () => {
       store.receive(siblingScope, { from: participant('sender@example.test'), subject: 'Fictional store isolation', text: 'Other store.' })
       const inventory = spyOn(store, 'snapshot').mockImplementation(() => { throw new Error('Identity and folder metadata must not hydrate mail') })
       try {
+        // Each mock address carries its own fictional HTML signature, sanitized like a Gmail one.
         expect((await h.inbox.sendingIdentities('alice', account.id)).identities).toEqual([
-          { email: mailbox.email, isPrimary: true, isDefault: true }, { email: mailbox.aliases[0]!, isPrimary: false, isDefault: false },
+          { email: mailbox.email, isPrimary: true, isDefault: true, signature: expect.stringContaining(`<b>Fictional mailbox</b><br /><span style="color:#5f6368">${mailbox.email}</span>`) },
+          { email: mailbox.aliases[0]!, isPrimary: false, isDefault: false, signature: expect.stringContaining(`<span style="color:#5f6368">${mailbox.aliases[0]!}</span> · <a href="https://example.test">example.test</a>`) },
         ])
         expect((await h.inbox.mailboxCandidates('alice', account.connectionId!)).map(candidate => ({ selector: candidate.selector, identities: candidate.identities }))).toEqual([
           { selector: { kind: 'address', value: mailbox.email }, identities: [mailbox.email] },

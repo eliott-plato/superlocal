@@ -33,11 +33,17 @@ function signatureHtml(value: string) {
 }
 
 // The editor serializes parsed markup, so compare against the browser's own rendering.
-function renderedSignature(value: string) {
-  const probe = document.createElement("div");
-  probe.innerHTML = signatureHtml(value);
-  return probe.textContent ?? "";
+// An inert <template> parses without loading images or running anything.
+function parsedHtml(html: string) {
+  const probe = document.createElement("template");
+  probe.innerHTML = html;
+  return probe;
 }
+function renderedSignature(value: string) {
+  return parsedHtml(signatureHtml(value)).content.textContent ?? "";
+}
+// Gmail's own marker: it lets the composer find the block and recipients' Gmail fold it away.
+const SIGNATURE_CLASS = "gmail_signature";
 
 type ComposerProps = {
   draft: Draft;
@@ -362,52 +368,6 @@ export default function Composer({
   const signatures = preferences.signaturesByAccount as
     Record<string, string> | undefined;
   const mailbox = accounts.find(account => account.id === draft.account);
-  const signature =
-    (mailbox && signatures?.[mailbox.email]) ?? preferences.signature;
-  // Any signature a mailbox may carry lets a moved draft's trailing signature be recognized.
-  const signatureCandidates = useMemo(
-    () =>
-      new Set(
-        [...Object.values(signatures ?? {}), preferences.signature]
-          .filter(Boolean)
-          .map(renderedSignature),
-      ),
-    [signatures, preferences.signature],
-  );
-  const signatureNode = (element: ParentNode) =>
-    [...element.children]
-      .reverse()
-      .find(child => signatureCandidates.has(child.textContent ?? ""));
-  // A reply that only carries the inserted signature still counts as empty for quick replies.
-  const withoutSignature = (body: string) => {
-    if (!signatureCandidates.size) return body;
-    const parsed = document.createElement("template");
-    parsed.innerHTML = body;
-    const node = signatureNode(parsed.content);
-    if (!node) return body;
-    node.remove();
-    return parsed.innerHTML;
-  };
-  const showQuickReplies =
-    inline &&
-    !draft.popOut &&
-    quickReplies.length > 0 &&
-    canUseQuickReplies({ mode: draft.mode, body: withoutSignature(draft.body) });
-  const syncSignature = (element: HTMLElement) => {
-    const node = signatureNode(element);
-    if (signature) {
-      if (node) {
-        const next = signatureHtml(signature);
-        if (node.innerHTML !== next) node.innerHTML = next;
-      } else if (
-        emptyDraftBody(element.innerHTML) &&
-        (draft.mode === "new" || preferences.signatureReplies !== false)
-      ) {
-        // Formatting-only markup is disposable; start writing on the first line.
-        element.innerHTML = `<div><br></div><div><br></div><div>${signatureHtml(signature)}</div>`;
-      }
-    } else if (node) node.remove();
-  };
   const sourceLocked = draft.mode !== "new" || !!draft.sourceMessageId;
   const replyMailbox = mailbox && (!draft.sourceId || mailbox.sourceId === draft.sourceId) ? mailbox
     : accounts.find(account => account.canSend && account.sourceId === draft.sourceId);
@@ -431,6 +391,61 @@ export default function Composer({
   const identities = senderGroups.flatMap(group => group.identities);
   const from = draft.from ?? mailbox?.email ?? "";
   const listedFrom = identities.find(identity => identity.account === draft.account && identity.email.toLowerCase() === from.toLowerCase());
+  // The From address's own provider (Gmail) signature wins; otherwise the one typed in Settings.
+  const providerSignatures = preferences.providerSignatures !== false;
+  const providerSignature = providerSignatures
+    ? identityState?.value?.identities.find(identity => identity.email.toLowerCase() === from.toLowerCase())?.signature
+    : undefined;
+  const typedSignature = preferences.signatureEnabled
+    ? (mailbox && signatures?.[mailbox.email]) ?? preferences.signature
+    : "";
+  const signature = providerSignature || (typedSignature ? signatureHtml(typedSignature) : "");
+  const signaturesOn = providerSignatures || preferences.signatureEnabled;
+  // Wait for the From address's provider signature so a fallback never flashes in first.
+  const signatureReady = !currentLoading;
+  const renderedSignatureHtml = useMemo(() => parsedHtml(signature).innerHTML, [signature]);
+  // Typed signatures saved before the block was marked are still recognized by their text.
+  const signatureCandidates = useMemo(
+    () =>
+      new Set(
+        [...Object.values(signatures ?? {}), preferences.signature]
+          .filter(Boolean)
+          .map(renderedSignature),
+      ),
+    [signatures, preferences.signature],
+  );
+  const signatureNode = (element: ParentNode) =>
+    [...element.children]
+      .reverse()
+      .find(child => child.classList.contains(SIGNATURE_CLASS) || signatureCandidates.has(child.textContent ?? ""));
+  // A reply that only carries the inserted signature still counts as empty for quick replies.
+  const withoutSignature = (body: string) => {
+    const parsed = parsedHtml(body);
+    const node = signatureNode(parsed.content);
+    if (!node) return body;
+    node.remove();
+    return parsed.innerHTML;
+  };
+  const showQuickReplies =
+    inline &&
+    !draft.popOut &&
+    quickReplies.length > 0 &&
+    canUseQuickReplies({ mode: draft.mode, body: withoutSignature(draft.body) });
+  const syncSignature = (element: HTMLElement) => {
+    const node = signatureNode(element);
+    if (signature) {
+      if (node) {
+        if (node.innerHTML !== renderedSignatureHtml) node.innerHTML = renderedSignatureHtml;
+        node.classList.add(SIGNATURE_CLASS);
+      } else if (
+        emptyDraftBody(element.innerHTML) &&
+        (draft.mode === "new" || preferences.signatureReplies !== false)
+      ) {
+        // Formatting-only markup is disposable; start writing on the first line.
+        element.innerHTML = `<div><br></div><div><br></div><div class="${SIGNATURE_CLASS}">${renderedSignatureHtml}</div>`;
+      }
+    } else if (node) node.remove();
+  };
   const missingFrom = !sendingAccounts.some(account => account.id === draft.account) || !!identityState?.value && !listedFrom;
   const [senderOpen, setSenderOpen] = useState(false);
   const [senderHighlight, setSenderHighlight] = useState(0);
@@ -546,7 +561,7 @@ export default function Composer({
   useLayoutEffect(() => {
     const element = editor.current;
     if (!element) return;
-    let body = draft.body;
+    const body = draft.body;
     const opened = initialized.current !== draft.id;
     if (opened) {
       initialized.current = draft.id;
@@ -565,24 +580,17 @@ export default function Composer({
     }
     // Do not replace the editable DOM on each keystroke: that would reset its caret.
     if (element.innerHTML !== body) element.innerHTML = body;
-    if (opened && preferences.signatureEnabled) {
-      syncSignature(element);
-      if (element.innerHTML !== body) {
-        body = element.innerHTML;
-        update({ body });
-      }
-    }
     if (opened && autoFocus) focusComposer();
   }, [draft.id, draft.body]);
 
-  // Switching From (same composer or a moved draft) swaps the trailing signature.
+  // Opening a draft adds the signature; switching From (same composer or a moved draft) swaps it.
   useLayoutEffect(() => {
     const element = editor.current;
-    if (!element || !preferences.signatureEnabled) return;
+    if (!element || !signaturesOn || !signatureReady) return;
     const before = element.innerHTML;
     syncSignature(element);
     if (element.innerHTML !== before) update({ body: element.innerHTML });
-  }, [signature]);
+  }, [draft.id, renderedSignatureHtml, signatureReady]);
 
   useLayoutEffect(() => {
     if (focusRequest > 0) focusComposer();

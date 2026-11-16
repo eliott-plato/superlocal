@@ -546,6 +546,12 @@ export function Settings({
           </div>
           <div className="settings-signature-options">
             {checkbox(
+              "providerSignatures",
+              "Use Gmail signatures",
+              true,
+              "Each address uses its own signature from Gmail, with its formatting, links and images. Those images load from Gmail's servers while you write. Turn this off to use the signature above instead.",
+            )}
+            {checkbox(
               "signatureReplies",
               "Include signature on replies and forwards",
               true,

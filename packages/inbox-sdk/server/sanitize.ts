@@ -858,6 +858,50 @@ export function sanitizeEmailBody(
 
 export const sanitizeHtmlContent = sanitizeEmailHtml
 
+/** Gmail caps signatures at 10,000 characters; anything far larger is not a signature. */
+export const MAX_SIGNATURE_HTML = 64 * 1024
+// Plain values only: no url(), expression(), var() or other functions that could fetch or compute.
+const signatureStyleValue = [/^(?!.*\b(?:url|expression|var|image-set|attr)\s*\()[\w\s#%.,'"()+-]{1,200}$/i]
+const signatureStyles = Object.fromEntries(['color', 'background-color', 'font-weight', 'font-style', 'font-size', 'font-family',
+  'text-decoration', 'text-align', 'line-height', 'vertical-align', 'width', 'height'].map(property => [property, signatureStyleValue]))
+
+/**
+ * Provider signatures are inserted into the owner's own composer and sent as written, so they keep only
+ * plain formatting, layout tables, https/mailto links and https images. Tracking pixels, scripts, forms,
+ * event handlers, classes, ids and every other attribute are removed.
+ */
+export function sanitizeSignatureHtml(html: string): string {
+  if (typeof html !== 'string' || !html.trim() || html.length > MAX_SIGNATURE_HTML) return ''
+  const clean = sanitizeHtml(html, {
+    allowedTags: ['div', 'p', 'br', 'span', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'font', 'small', 'big', 'sub', 'sup',
+      'a', 'img', 'hr', 'blockquote', 'ul', 'ol', 'li', 'table', 'tbody', 'thead', 'tr', 'td', 'th'],
+    allowedAttributes: {
+      '*': ['style'], a: ['href'], img: ['src', 'alt', 'width', 'height'], font: ['color', 'face', 'size'],
+      td: ['colspan', 'rowspan', 'align', 'valign', 'width'], th: ['colspan', 'rowspan', 'align', 'valign', 'width'],
+      table: ['cellpadding', 'cellspacing', 'border', 'width'],
+    },
+    allowedStyles: { '*': signatureStyles },
+    allowedSchemes: ['https', 'mailto'],
+    allowedSchemesByTag: { a: ['https', 'http', 'mailto', 'tel'], img: ['https'] },
+    allowProtocolRelative: false,
+    disallowedTagsMode: 'discard',
+    nonTextTags: ['script', 'style', 'textarea', 'option', 'noscript', 'title', 'head', 'template', 'svg', 'math', 'iframe', 'object'],
+    exclusiveFilter: frame => frame.tag === 'img' && (!frame.attribs.src || isTrackingImage({
+      src: frame.attribs.src, width: frame.attribs.width, height: frame.attribs.height,
+    })),
+    transformTags: {
+      img: (tagName, attribs) => {
+        const sized = Object.fromEntries(['width', 'height'].flatMap(key =>
+          attribs[key] && /^\d{1,4}$/.test(attribs[key]!) ? [[key, attribs[key]!]] : []))
+        return { tagName, attribs: { ...(attribs.src ? { src: attribs.src } : {}), ...(attribs.alt ? { alt: attribs.alt } : {}),
+          ...(attribs.style ? { style: attribs.style } : {}), ...sized } }
+      },
+    },
+  })
+  // A signature made only of empty formatting is no signature.
+  return /[^\s\u00a0\u200b]/.test(clean.replace(/<(?!img\b)[^>]*>/gi, '').replace(/&nbsp;/g, ' ')) ? clean.trim() : ''
+}
+
 export const MAX_SVG_IMAGE_BYTES = 256 * 1024
 
 type SvgNode = {

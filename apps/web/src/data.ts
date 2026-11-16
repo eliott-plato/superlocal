@@ -147,6 +147,8 @@ export type Preferences = {
   recentOpens: boolean;
   signature: string;
   signatureEnabled: boolean;
+  /** Use each sending address's own signature from its provider (Gmail), ahead of the typed one. */
+  providerSignatures: boolean;
   autoAdvance: boolean;
   markRead: boolean;
   spellcheck: boolean;
@@ -188,6 +190,7 @@ export const defaultPreferences: Preferences = {
   recentOpens: true,
   signature: "",
   signatureEnabled: false,
+  providerSignatures: true,
   autoAdvance: true,
   markRead: true,
   spellcheck: true,
