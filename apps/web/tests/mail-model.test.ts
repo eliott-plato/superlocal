@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from "../src/data.ts";
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView, selectZeroQueue, zeroEligible, zeroScope, sameZeroScope, zeroStorageKey, zeroReviewVersion, zeroBatchCandidate, normalizeZeroSession, ZERO_QUEUE_LIMIT, type ZeroSession } from "../src/mail-view.ts";
-import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
+import { ATTENTION_VERSION, classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
@@ -2220,6 +2220,11 @@ test("custom filters implement exact sender addresses, OR, parentheses, negation
 test("Important and Other partition eligible unified conversations while custom filters intentionally overlap", () => {
   const other = classifyAttention({ subject: "Weekly digest", preview: "", facts: { version: 1, listId: true, listUnsubscribe: true } });
   const important = classifyAttention({ subject: "Please reply", preview: "" });
+  // Calendar invitations, updates and cancellations are Important even when they read like a routine booking notice; lists and RSVPs are not covered.
+  for (const subject of ["Invitation: Fictional sync @ Mon", "Updated invitation with note: Fictional sync", "Canceled event: Fictional sync", "Cancelled: Booking confirmation for fictional sync", "Invitation mise à jour : Fictional sync", "Événement annulé : Fictional sync"])
+    assert.deepEqual(classifyAttention({ subject, preview: "Booking confirmed", facts: { version: 1, unsubscribeLink: true } }), { category: "Important", reason: "calendar", version: ATTENTION_VERSION }, subject);
+  assert.equal(classifyAttention({ subject: "Invitation: our weekly webinar", preview: "", facts: { version: 1, listId: true, listUnsubscribe: true } }).category, "Other");
+  assert.notEqual(classifyAttention({ subject: "Accepted: Fictional sync", preview: "Booking confirmed" }).reason, "calendar");
   const make = (id: string, sourceId: string, box: string, attention = other): Mail => ({ ...inbox, id: `${box}:${id}`, sourceId, sdkThreadId: id, mailboxId: box, account: box,
     folder: "Inbox", locations: ["Inbox"], split: "Important", email: "john@doe.com", messages: [{ ...inbox.messages[0], id: `${sourceId}:${id}`, email: "john@doe.com", outgoing: false, nativeFolder: "inbox", attention,
       memberships: [{ mailboxId: box, messageId: `${sourceId}:${id}`, revision: 1, done: false, snoozedUntil: null }] }] });

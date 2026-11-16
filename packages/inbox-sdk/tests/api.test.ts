@@ -13269,6 +13269,18 @@ describe('AI triage inference and local scoring', () => {
     ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
     expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 0 })
     expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: 0 })
+    // Calendar invitations, updates and cancellations need no reply but still stay Important, with or without personalization.
+    for (const subject of ['Invitation: Fictional planning sync', 'Canceled event: Fictional planning sync']) {
+      const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject, text: 'Fictional event details.' }] }
+      const invitation = validateAiAssessment({ ...base, type: 'invitation', evidence: [{ messageRef: 'message-1', quote: subject, field: 'type' }] }, source)
+      for (const personalization of [true, false]) {
+        const scored = scoreAiTriage(invitation, { ...neutral, explicitAffinity: -3, learnedTopicAffinity: -3 }, { personalization })
+        expect(scored).toMatchObject({ category: 'Important', score: 20, contributions: [{ name: 'calendar_gate', value: 20 }], version: AI_PREFERENCE_VERSION })
+      }
+      expect(scoreAiTriage(invitation, neutral, { override: 'Other' })).toMatchObject({ category: 'Other', score: 20 })
+      expect(scoreAiTriage({ ...invitation, risk: 'phishing_suspected' }, neutral)).toMatchObject({ category: 'Other', score: -100 })
+      expect(scoreAiTriage({ ...invitation, risk: 'unsolicited' }, neutral)).toMatchObject({ category: 'Other', score: 0 })
+    }
   })
 
   test('task-aware obligations remain Important across genres while risk uncertainty and manual overrides keep precedence', () => {

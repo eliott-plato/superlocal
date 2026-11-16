@@ -1,6 +1,6 @@
 import type { MailFacts } from '../../packages/inbox-sdk/src/contracts'
 
-export const ATTENTION_VERSION = 'baseline-2'
+export const ATTENTION_VERSION = 'baseline-3'
 export type AttentionDecision = { category: 'Important' | 'Other'; reason: string; version: string }
 export function conversationAttention(mail: { split: string; attentionCategory?: AttentionDecision['category']; attentionOverride?: { override: { category: AttentionDecision['category'] } | null }; messages: Array<{ pending?: boolean; outgoing?: boolean; nativeFolder?: string; attention?: AttentionDecision; memberships?: Array<{ done: boolean; snoozedUntil: string | null }> }> }, now = Date.now()): AttentionDecision['category'] {
   const eligible = mail.messages.filter(message => !message.pending && !message.outgoing && (!message.nativeFolder || message.nativeFolder === 'inbox')
@@ -11,11 +11,15 @@ export function conversationAttention(mail: { split: string; attentionCategory?:
   if (!eligible.some(message => message.attention)) return eligible.some(message => message.nativeFolder || message.memberships) ? 'Important' : mail.split === 'Other' ? 'Other' : 'Important'
   return eligible.every(message => message.attention?.category === 'Other') ? 'Other' : 'Important'
 }
+/** Subject prefixes calendar systems put on invitations, updates and cancellations (English and French). RSVP replies (Accepted:/Declined:) are excluded. */
+const calendarSubject = /^\s*(?:(?:updated |new )?invitation(?: updated| mise à jour)?(?: with note| avec note)?|(?:canceled|cancelled) event(?: with note)?|event (?:canceled|cancelled|updated|rescheduled)|événement (?:annulé|mis à jour|modifié)(?: avec note)?|invitation annulée|new event|rescheduled|canceled|cancelled|annulé|annulée|reprogrammé|reprogrammée)\s*:/i
 /** Fixed application policy. Explicit feedback is deliberately not an input. */
 export function classifyAttention(message: { subject: string; preview: string; facts?: MailFacts }): AttentionDecision {
   const facts = message.facts ?? { version: 1 }
   const text = `${message.subject}\n${message.preview}`.slice(0, 4096)
   const result = (category: AttentionDecision['category'], reason: string) => ({ category, reason, version: ATTENTION_VERSION })
+  // Calendar invitations, updates and cancellations from calendar systems (Google, Outlook, booking tools), not mailing lists.
+  if (!facts.listId && !facts.bulk && !facts.nativeCategories?.includes('promotions') && calendarSubject.test(message.subject)) return result('Important', 'calendar')
   // Clear requests win over subscription headers; delivery/receipt notices do not.
   if (/\b(?:mentioned you|you were mentioned|assigned to you|review requested|requested your review|build failed|deployment failed|incident|outage|urgent|support (?:request|ticket|reply)|action required|please (?:reply|respond|review|confirm)|invoice|payment (?:due|failed)|security (?:alert|notice|code)|suspicious|password reset|verification code|one[ -]time (?:code|password)|two[ -]factor|2fa)\b/i.test(text)) return result('Important', 'actionable-notification')
   if (/\b(?:receipt|payment (?:received|confirmation)|order (?:confirmation|confirmed|shipped)|delivery (?:confirmation|confirmed)|package delivered|tracking (?:number|update)|booking (?:confirmed|confirmation)|authentication report|dmarc|weekly usage|usage summary|usage report)\b/i.test(text)) return result('Other', 'routine-notification')
