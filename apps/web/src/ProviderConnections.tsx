@@ -113,7 +113,12 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
     const syncs: Array<[string, "latest" | "backfill", number]> = [];
     if (target.mailboxSelection === "automatic") {
       const boxes = store.getSnapshot().mailboxes.filter(box => connectionIds.includes(box.connectionId) && box.status === "active");
-      for (const box of boxes) { push(box.name || scopeLabel(box.selector)); syncs.push([box.id, "latest", 25]); }
+      const sources = new Set<string>();
+      for (const box of boxes) {
+        push(box.name || scopeLabel(box.selector)); syncs.push([box.id, "latest", 25]);
+        // Start history once per source; the host resumes it a page at a time.
+        if (!sources.has(box.sourceId)) { sources.add(box.sourceId); syncs.push([box.id, "backfill", 50]); }
+      }
       if (!boxes.length) note = "Its mailbox is paused. Resume it in Mailboxes to load mail.";
     } else {
       const existing = new Set(store.getSnapshot().mailboxes.filter(box => box.status !== "detached").map(box => mailboxKey(box.sourceId, box.selector)));
